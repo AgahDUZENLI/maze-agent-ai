@@ -59,6 +59,7 @@ class Hazard(Enum):
     TP_GREEN   = "tp_green"
     TP_YELLOW  = "tp_yellow"
     TP_PURPLE  = "tp_purple"
+    TP_RED     = "tp_red"
 
 HAZARD_LABELS = {
     Hazard.FIRE:      "FIRE",
@@ -66,6 +67,7 @@ HAZARD_LABELS = {
     Hazard.TP_GREEN:  "TP_GREEN",
     Hazard.TP_YELLOW: "TP_YELLOW",
     Hazard.TP_PURPLE: "TP_PURPLE",
+    Hazard.TP_RED:     "TP_RED",
 }
 
 HAZARD_LABELS = {
@@ -74,6 +76,7 @@ HAZARD_LABELS = {
     Hazard.TP_GREEN:  "TP_GREEN",
     Hazard.TP_YELLOW: "TP_YELLOW",
     Hazard.TP_PURPLE: "TP_PURPLE",
+    Hazard.TP_RED:     "TP_RED",
 }
 
 # ---------------------------------------------------------------------------
@@ -152,6 +155,9 @@ def _classify_color(r, g, b):
     # purple teleporter
     if r > 90 and r < 210 and g < 150 and b > 140:
         return Hazard.TP_PURPLE
+    
+    if r > 200 and g < 100 and b < 100:
+        return Hazard.TP_RED
 
     return None
 
@@ -202,6 +208,7 @@ def get_teleport_points(hazards):
         Hazard.TP_GREEN: sorted([cell for cell, hz in hazards.items() if hz == Hazard.TP_GREEN]),
         Hazard.TP_YELLOW: sorted([cell for cell, hz in hazards.items() if hz == Hazard.TP_YELLOW]),
         Hazard.TP_PURPLE: sorted([cell for cell, hz in hazards.items() if hz == Hazard.TP_PURPLE]),
+        Hazard.TP_RED : sorted([cell for cell, hz in hazards.items() if hz == Hazard.TP_RED]),
     }
 
 
@@ -436,6 +443,7 @@ def print_summary(h_walls, hazards):
     print(f"Green TP        : {counts.get(Hazard.TP_GREEN, 0)}")
     print(f"Yellow TP       : {counts.get(Hazard.TP_YELLOW, 0)}")
     print(f"Purple TP       : {counts.get(Hazard.TP_PURPLE, 0)}")
+    print(f"Red TP          : {counts.get(Hazard.TP_RED, 0)}")
 
     print("=" * 55)
 
