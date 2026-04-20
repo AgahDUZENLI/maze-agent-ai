@@ -45,6 +45,7 @@ class HybridAgent:
         # ── Visited tracking ──────────────────────────────────────────────────
         self.visited:         Set[Tuple] = set()  # global — for A* and metrics
         self.episode_visited: Set[Tuple] = set()  # per-episode — for BFS frontier
+        self.episode_world_actions: List[int] = []
 
         # ── Q-table ───────────────────────────────────────────────────────────
         self.q_table = np.zeros((GRID, GRID, 4), dtype=np.float32)
@@ -102,10 +103,10 @@ class HybridAgent:
         self.episode_confused = 0
         self.episode_cells    = [start_pos]
         self.total_episodes  += 1
+        self.episode_world_actions = []
 
-        if self.phase == 2 and self.goal_pos is not None:
-            self.action_queue = self._astar(self.start_pos, self.goal_pos)
-            self.optimal_path = list(self.action_queue)
+        if self.phase == 2 and self.optimal_path:
+            self.action_queue = list(self.optimal_path)
 
     def _trusted_prefix(self, path: List[int], max_len: int = 5) -> List[int]:
         """
@@ -353,6 +354,16 @@ class HybridAgent:
 
         batched_turn = len(self.last_planned_actions) > 1
 
+        def save_successful_replay():
+            overflow = len(self.last_planned_actions) - result.actions_executed
+            successful_trace = list(self.episode_world_actions)
+
+            if overflow > 0:
+                successful_trace = successful_trace[:-overflow]
+
+            if not self.optimal_path or len(successful_trace) < len(self.optimal_path):
+                self.optimal_path = successful_trace
+
         # If we batched actions, only keep facts that are actually safe to infer.
         # Do NOT try to localize which exact intermediate action caused the event.
         if batched_turn:
@@ -362,6 +373,7 @@ class HybridAgent:
                 self.total_deaths_ever += 1
                 self.current_pos = self.start_pos
                 self.action_queue = []
+                self.phase = 1
                 self._advance_internal_clock(result.actions_executed)
                 return
 
@@ -371,9 +383,14 @@ class HybridAgent:
                 self._finish_episode(success=True)
                 self.action_queue = []
 
+                save_successful_replay()
+
                 if self.phase == 1:
                     self.phase = 2
-                    self.optimal_path = self._astar(self.start_pos, self.goal_pos)
+                    steps = len(self.optimal_path)
+                    print(f"\n  ★ Goal found at {new_pos}! Switching to REPLAY MODE.")
+                    print(f"  ★ Replay path : {steps} steps ({steps//5 + 1} turns)")
+
                 self._advance_internal_clock(result.actions_executed)
                 return
 
@@ -381,16 +398,28 @@ class HybridAgent:
                 self.is_confused = not self.is_confused
                 self.episode_confused += 1
                 self.action_queue = []
+                self.phase = 1
 
             # final position is trustworthy, intermediate causes are not
             self._remember_position(new_pos)
 
             # if something unexpected happened in a batched turn, drop back to cautious mode
             if result.wall_hits > 0 or result.teleported or result.is_confused:
+                print(
+                    f"[REPLAY BREAK] "
+                    f"pos={new_pos} "
+                    f"wall_hits={result.wall_hits} "
+                    f"teleported={result.teleported} "
+                    f"confused={result.is_confused} "
+                    f"actions_executed={result.actions_executed} "
+                    f"remaining_replay={len(self.action_queue)}"
+                )
                 self.action_queue = []
+                self.phase = 1
+
             self._advance_internal_clock(result.actions_executed)
             return
-        
+
         # ── WALL ──────────────────────────────────────────────────────────────
         if result.wall_hits > 0 and self.prev_pos and self.prev_action is not None:
             self.walls.add((*self.prev_pos, self.prev_action))
@@ -402,7 +431,7 @@ class HybridAgent:
                 self._update_q(self.prev_pos, self.prev_action, -2, self.prev_pos)
             self.action_queue = []
             self._advance_internal_clock(result.actions_executed)
-            return  # didn't move
+            return
 
         # ── DEATH ─────────────────────────────────────────────────────────────
         if result.is_dead:
@@ -410,25 +439,24 @@ class HybridAgent:
             if self.phase == 1 and self.prev_pos and self.prev_action is not None:
                 self._update_q(self.prev_pos, self.prev_action, -100, new_pos)
                 self.q_table[new_pos[0], new_pos[1], :] = -200.0
-            self.episode_deaths    += 1
+            self.episode_deaths += 1
             self.total_deaths_ever += 1
-            self.current_pos        = self.start_pos
-            self.action_queue       = []
-            if self.phase == 2 and self.goal_pos:
-                self.action_queue = self._astar(self.start_pos, self.goal_pos)
+            self.current_pos = self.start_pos
+            self.action_queue = []
+            self.phase = 1
             self._advance_internal_clock(result.actions_executed)
             return
 
         # ── TELEPORT ──────────────────────────────────────────────────────────
         if result.teleported and self.prev_pos and self.prev_action is not None:
-            dr, dc   = DELTAS[self.prev_action]
-            pad      = (self.prev_pos[0] + dr, self.prev_pos[1] + dc)
+            dr, dc = DELTAS[self.prev_action]
+            pad = (self.prev_pos[0] + dr, self.prev_pos[1] + dc)
             if pad != new_pos:
-                self.teleports[pad]     = new_pos
+                self.teleports[pad] = new_pos
                 self.teleports[new_pos] = pad
             self.action_queue = []
-            if self.phase == 2 and self.goal_pos:
-                self.action_queue = self._astar(new_pos, self.goal_pos)
+            if self.phase == 2:
+                self.phase = 1
 
         # ── CONFUSION ─────────────────────────────────────────────────────────
         if result.is_confused:
@@ -438,6 +466,8 @@ class HybridAgent:
             if self.phase == 1 and self.prev_pos and self.prev_action is not None:
                 self._update_q(self.prev_pos, self.prev_action, -5, new_pos)
             self.action_queue = []
+            if self.phase == 2:
+                self.phase = 1
 
         # ── GOAL ──────────────────────────────────────────────────────────────
         if result.is_goal_reached:
@@ -450,12 +480,15 @@ class HybridAgent:
             self.current_pos = new_pos
             self._finish_episode(success=True)
             self.action_queue = []
+
+            save_successful_replay()
+
             if self.phase == 1:
-                self.phase        = 2
-                self.optimal_path = self._astar(self.start_pos, self.goal_pos)
+                self.phase = 2
                 steps = len(self.optimal_path)
-                print(f"\n  ★ Goal found at {new_pos}! Switching to A* SPEED RUN.")
-                print(f"  ★ Optimal path : {steps} steps ({steps//5+1} turns)")
+                print(f"\n  ★ Goal found at {new_pos}! Switching to REPLAY MODE.")
+                print(f"  ★ Replay path : {steps} steps ({steps//5 + 1} turns)")
+
             self._advance_internal_clock(result.actions_executed)
             return
 
@@ -480,23 +513,34 @@ class HybridAgent:
         self.episode_turns += 1
         self.total_turns_ever += 1
 
-        # Phase 2: follow known path, batch only trusted prefixes
+        # Phase 2: replay known successful path, but batch only trusted segments
         if self.phase == 2:
-            if not self.action_queue and self.goal_pos and self.current_pos:
-                self.action_queue = self._astar(self.current_pos, self.goal_pos)
-
             if self.action_queue:
                 trusted = self._trusted_prefix(self.action_queue, max_len=5)
 
                 if trusted:
                     self.action_queue = self.action_queue[len(trusted):]
+                    print(
+                        f"[REPLAY SEND] "
+                        f"batch={trusted} "
+                        f"remaining_after_send={len(self.action_queue)} "
+                        f"pos={self.current_pos}"
+                    )
                     return self._submit(trusted)
 
-                # If the path is not trusted enough to batch, take only one step.
+                # If next replay segment is risky, replay one action at a time
                 next_step = self.action_queue.pop(0)
+                print(
+                    f"[REPLAY SEND 1] "
+                    f"step={[next_step]} "
+                    f"remaining_after_send={len(self.action_queue)} "
+                    f"pos={self.current_pos}"
+                )
                 return self._submit([next_step])
 
-            return self._submit([random.choice(MOVE_ACTIONS)])
+            # Replay finished or failed; fall back to cautious exploration
+            self.phase = 1
+            self.action_queue = []
 
         # Phase 1: cautious exploration = 1 action per turn
         if not self.action_queue:
@@ -515,6 +559,7 @@ class HybridAgent:
             self.prev_action = desired_actions[0] if desired_actions[0] in MOVE_ACTIONS else None
 
         self.last_planned_actions = list(desired_actions)
+        self.episode_world_actions.extend(desired_actions)
         self.last_turn_start_tmod20 = self._current_tmod20()
 
         submitted = []
