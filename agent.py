@@ -65,11 +65,16 @@ class HybridAgent:
         self.episode_cells:   List[Tuple] = []
         self.optimal_path:    List[int]   = []
 
+        self.last_planned_actions: List[int] = []
+        self.last_submitted_actions: List[int] = []
+
     # ─────────────────────────────────────────────────────────────────────────
     # RESET
     # ─────────────────────────────────────────────────────────────────────────
 
     def reset_episode(self, start_pos: Tuple) -> None:
+        self.last_planned_actions = []
+        self.last_submitted_actions = []
         self.start_pos        = start_pos
         self.current_pos      = start_pos
         self.prev_pos         = None
@@ -89,6 +94,51 @@ class HybridAgent:
             self.action_queue = self._astar(self.start_pos, self.goal_pos)
             self.optimal_path = list(self.action_queue)
 
+    def _trusted_prefix(self, path: List[int], max_len: int = 5) -> List[int]:
+        """
+        Return the longest safe prefix (up to 5 actions) that we are willing
+        to batch in one turn.
+
+        We only batch through plain known cells:
+        - no known fire
+        - no known confusion cells
+        - no teleport pads
+        - no blocked edges
+        """
+        if not path or self.current_pos is None:
+            return []
+
+        # keep batching conservative while confused
+        if self.is_confused:
+            return []
+
+        r, c = self.current_pos
+        prefix = []
+
+        for a in path[:max_len]:
+            if not self._can_move(r, c, a, ignore_fire=False):
+                break
+
+            dr, dc = DELTAS[a]
+            nr, nc = r + dr, c + dc
+
+            if (nr, nc) in self.dead_cells:
+                break
+            if (nr, nc) in self.confuse:
+                break
+            if (nr, nc) in self.teleports:
+                break
+
+            prefix.append(a)
+            r, c = nr, nc
+
+        return prefix
+
+    def _remember_position(self, pos: Tuple[int, int]) -> None:
+        self.visited.add(pos)
+        self.episode_visited.add(pos)
+        self.episode_cells.append(pos)
+        self.current_pos = pos
     # ─────────────────────────────────────────────────────────────────────────
     # MAP
     # ─────────────────────────────────────────────────────────────────────────
@@ -160,7 +210,7 @@ class HybridAgent:
     # PHASE 2 — A*
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _astar(self, start: Tuple, goal: Tuple, ignore_fire=True) -> List[int]:
+    def _astar(self, start: Tuple, goal: Tuple, ignore_fire=False) -> List[int]:
         if not start or not goal:
             return []
 
@@ -206,6 +256,45 @@ class HybridAgent:
     def _process_result(self, result) -> None:
         new_pos = result.current_position
 
+        batched_turn = len(self.last_planned_actions) > 1
+
+        # If we batched actions, only keep facts that are actually safe to infer.
+        # Do NOT try to localize which exact intermediate action caused the event.
+        if batched_turn:
+            if result.is_dead:
+                self.dead_cells.add(new_pos)
+                self.episode_deaths += 1
+                self.total_deaths_ever += 1
+                self.current_pos = self.start_pos
+                self.action_queue = []
+                return
+
+            if result.is_goal_reached:
+                self.goal_pos = new_pos
+                self._remember_position(new_pos)
+                self._finish_episode(success=True)
+                self.action_queue = []
+
+                if self.phase == 1:
+                    self.phase = 2
+                    self.optimal_path = self._astar(self.start_pos, self.goal_pos)
+
+                return
+
+            if result.is_confused:
+                self.is_confused = not self.is_confused
+                self.episode_confused += 1
+                self.action_queue = []
+
+            # final position is trustworthy, intermediate causes are not
+            self._remember_position(new_pos)
+
+            # if something unexpected happened in a batched turn, drop back to cautious mode
+            if result.wall_hits > 0 or result.teleported or result.is_confused:
+                self.action_queue = []
+
+            return
+        
         # ── WALL ──────────────────────────────────────────────────────────────
         if result.wall_hits > 0 and self.prev_pos and self.prev_action is not None:
             self.walls.add((*self.prev_pos, self.prev_action))
@@ -288,33 +377,54 @@ class HybridAgent:
         if last_result is not None:
             self._process_result(last_result)
 
-        self.episode_turns    += 1
+        self.episode_turns += 1
         self.total_turns_ever += 1
 
-        # ── PHASE 2: A* — 5 actions per turn ─────────────────────────────────
+        # Phase 2: follow known path, batch only trusted prefixes
         if self.phase == 2:
+            if not self.action_queue and self.goal_pos and self.current_pos:
+                self.action_queue = self._astar(self.current_pos, self.goal_pos)
+
             if self.action_queue:
-                batch, self.action_queue = self.action_queue[:5], self.action_queue[5:]
-                return self._submit(batch)
-            if self.goal_pos and self.current_pos:
-                path = self._astar(self.current_pos, self.goal_pos)
-                if path:
-                    self.action_queue = path[5:]
-                    return self._submit(path[:5])
+                trusted = self._trusted_prefix(self.action_queue, max_len=5)
+
+                if trusted:
+                    self.action_queue = self.action_queue[len(trusted):]
+                    return self._submit(trusted)
+
+                # If the path is not trusted enough to batch, take only one step.
+                next_step = self.action_queue.pop(0)
+                return self._submit([next_step])
+
             return self._submit([random.choice(ACTIONS)])
 
-        # ── PHASE 1: biased BFS — 1 action per turn ───────────────────────────
+        # Phase 1: cautious exploration = 1 action per turn
         if not self.action_queue:
             self.action_queue = self._bfs_explore()
+
         if self.action_queue:
             return self._submit([self.action_queue.pop(0)])
+
         return self._submit([random.choice(ACTIONS)])
 
-    def _submit(self, actions: List[int]) -> List[int]:
-        if actions and self.current_pos is not None:
-            self.prev_pos    = self.current_pos
-            self.prev_action = actions[0]
-        return actions or [random.choice(ACTIONS)]
+    def _submit(self, desired_actions: List[int]) -> List[int]:
+        desired_actions = desired_actions or [random.choice(ACTIONS)]
+
+        if self.current_pos is not None:
+            self.prev_pos = self.current_pos
+            self.prev_action = desired_actions[0]   # world-direction action
+
+        self.last_planned_actions = list(desired_actions)
+
+        # If confused, submit the inverse so the environment's inversion
+        # produces the world move we actually want.
+        submitted = [
+            INVERT[a] if self.is_confused else a
+            for a in desired_actions
+        ]
+
+        self.last_submitted_actions = list(submitted)
+        return submitted
 
     # ─────────────────────────────────────────────────────────────────────────
     # BOOKKEEPING

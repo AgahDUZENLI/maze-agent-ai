@@ -16,6 +16,8 @@ ACTION_UP    = 0
 ACTION_DOWN  = 1
 ACTION_LEFT  = 2
 ACTION_RIGHT = 3
+ACTION_WAIT = 4
+VALID_ACTIONS = {ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, ACTION_WAIT}
 
 # How each action changes (row, col)
 DELTAS = {
@@ -168,15 +170,11 @@ class MazeEnvironment:
     # ────────────────────────────────────────────────────────────────────────
 
     def reset(self) -> Tuple[int, int]:
-        self.episode_number += 1
-        self.hazards, self.fire_pivots = update_fire_in_hazards(
-            self.hazards,
-            self.fire_pivots
-        )
-
+        # Start each episode from the original hazard layout
+        self.hazards = dict(self.base_hazards)
+        self.fire_pivots = None
         self.teleport_map = self._build_teleport_map(self.hazards)
 
-        # ── Reset agent state ────────────────────────────────────────────────
         self.agent_pos      = self.start
         self.is_confused    = False
         self.confused_turns = 0
@@ -185,15 +183,25 @@ class MazeEnvironment:
         self.confused_count = 0
         self.cells_visited  = [self.start]
         self.goal_reached   = False
+        self.atomic_action_count = 0
 
+        self.episode_number += 1
         return self.start
 
     # ────────────────────────────────────────────────────────────────────────
     # Step — the main function the agent calls every turn
     # ────────────────────────────────────────────────────────────────────────
+    def _tick_fire_clock(self) -> None:
+        self.atomic_action_count += 1
+
+        if self.atomic_action_count % 5 == 0:
+            self.hazards, self.fire_pivots = update_fire_in_hazards(
+                self.hazards,
+                self.fire_pivots
+            )
+
 
     def step(self, actions: List[int]) -> TurnResult:
-
         if not actions:
             raise ValueError("Must submit at least 1 action per turn.")
         if len(actions) > 5:
@@ -202,86 +210,69 @@ class MazeEnvironment:
         result = TurnResult()
         self.turn_count += 1
 
-        # Process each action one at a time
         for i, action in enumerate(actions):
-
-            # ── WAIT: agent burns this step, nothing happens ─────────────────
-            # Used to end the turn early and advance fire rotation
-            if action == 4:   # ACTION_WAIT
-                result.actions_executed = i + 1
-                continue   # skip to next action slot
-
-            # ── CONFUSION: invert the action if confused ─────────────────────
-            effective_action = INVERT_ACTION[action] if self.is_confused else action
-
-            # ── WALLS: try to move ────────────────────────────────────────────
-            direction = DIRECTION_NAMES[effective_action]
-            row, col  = self.agent_pos
-
-            if not can_move(row, col, direction, self.h_walls, self.v_walls):
-                # Wall blocks movement — agent stays, wall_hits increments
-                result.wall_hits += 1
-                result.actions_executed = i + 1
-                continue   # move on to next action in the list
-
-            # Movement successful — update position
-            dr, dc         = DELTAS[effective_action]
-            self.agent_pos = (row + dr, col + dc)
-            self.cells_visited.append(self.agent_pos)
-
-            # ── Check what's in the new cell ──────────────────────────────────
-            cell_hazard = self.hazards.get(self.agent_pos)
-
-            # ── TELEPORTER ────────────────────────────────────────────────────
-            # Spec: "stepping on teleport pad instantly moves agent"
-            # The agent lands on the pad, then immediately teleports.
-            # current_position in TurnResult shows the DESTINATION.
-            if self.agent_pos in self.teleport_map:
-                destination    = self.teleport_map[self.agent_pos]
-                self.agent_pos = destination
-                self.cells_visited.append(destination)
-                result.teleported = True
-
-                # After teleporting, check what's at the destination
-                cell_hazard = self.hazards.get(self.agent_pos)
-
-            # ── CONFUSION TRAP ────────────────────────────────────────────────
-            # Acts as a TOGGLE SWITCH:
-            #   Hit confusion cell while normal   → controls inverted (ON)
-            #   Hit confusion cell while confused → controls restored  (OFF)
-            if cell_hazard == Hazard.CONFUSION:
-                self.is_confused = not self.is_confused   # toggle
-                result.is_confused  = True
-                self.confused_count += 1
-
-            # ── FIRE (death) ──────────────────────────────────────────────────
-            # Spec: "agent dies instantly upon entering pit cell"
-            # Remaining actions in the list are ignored
-            # Agent respawns at start NEXT turn (not immediately)
-            if cell_hazard == Hazard.FIRE:
-                result.is_dead          = True
-                result.current_position = self.agent_pos   # show WHERE agent died
-                result.actions_executed = i + 1
-                self.death_count       += 1
-
-                # Respawn at start — agent will be here next turn
-                self.agent_pos = self.start
-
-                return result   # stop processing remaining actions
-
-            # ── GOAL ──────────────────────────────────────────────────────────
-            # Spec: "episode ends immediately" when goal is reached
-            if self.agent_pos == self.goal:
-                result.is_goal_reached  = True
-                result.current_position = self.agent_pos
-                result.actions_executed = i + 1
-                self.goal_reached       = True
-
-                return result   # stop processing remaining actions
+            if action not in VALID_ACTIONS:
+                raise ValueError(f"Invalid action: {action}")
 
             result.actions_executed = i + 1
 
-        # Confusion is a toggle — no countdown needed
+            # WAIT still counts as an atomic action for fire timing
+            if action == ACTION_WAIT:
+                self._tick_fire_clock()
+                continue
+
+            effective_action = INVERT_ACTION[action] if self.is_confused else action
+            direction = DIRECTION_NAMES[effective_action]
+
+            row, col = self.agent_pos
+            if not can_move(row, col, direction, self.h_walls, self.v_walls):
+                result.wall_hits += 1
+                self._tick_fire_clock()
+                continue
+
+            # successful move
+            dr, dc = DELTAS[effective_action]
+            self.agent_pos = (row + dr, col + dc)
+            self.cells_visited.append(self.agent_pos)
+
+            cell_hazard = self.hazards.get(self.agent_pos)
+
+            # teleport
+            if self.agent_pos in self.teleport_map:
+                destination = self.teleport_map[self.agent_pos]
+                self.agent_pos = destination
+                self.cells_visited.append(destination)
+                result.teleported = True
+                cell_hazard = self.hazards.get(self.agent_pos)
+
+            # confusion
+            if cell_hazard == Hazard.CONFUSION:
+                self.is_confused = not self.is_confused
+                result.is_confused = True
+                self.confused_count += 1
+
+            # death
+            if cell_hazard == Hazard.FIRE:
+                result.is_dead = True
+                result.current_position = self.agent_pos
+                self.death_count += 1
+
+                self._tick_fire_clock()
+
+                # respawn next turn
+                self.agent_pos = self.start
+                return result
+
+            # goal
+            if self.agent_pos == self.goal:
+                result.is_goal_reached = True
+                result.current_position = self.agent_pos
+                self.goal_reached = True
+
+                self._tick_fire_clock()
+                return result
+
+            self._tick_fire_clock()
 
         result.current_position = self.agent_pos
         return result
@@ -317,3 +308,5 @@ class MazeEnvironment:
         """Print all current fire cell positions."""
         fire = [(r,c) for (r,c), hz in self.hazards.items() if hz == Hazard.FIRE]
         print(f"Fire cells this episode ({len(fire)}): {sorted(fire)}")
+
+        

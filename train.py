@@ -20,6 +20,16 @@ def train():
 
     env   = MazeEnvironment(MAZE_PATH, HAZARD_PATH)
     agent = HybridAgent()
+
+    print("fresh agent check")
+    print("walls:", len(agent.walls))
+    print("teleports:", len(agent.teleports))
+    print("confuse:", len(agent.confuse))
+    print("visited:", len(agent.visited))
+    print("goal_pos:", agent.goal_pos)
+    print("phase:", agent.phase)
+    print("q_table_nonzero:", np.count_nonzero(agent.q_table))
+    
     viz   = MazeVisualizer(MAZE_PATH)
 
     start_time = time.time()
