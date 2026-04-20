@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 *.zip
 4368 Maze Solver Group Project Specifications v4.pdf
+q_table_alpha.npy
+viz/
+results/*
+!results/.gitkeep

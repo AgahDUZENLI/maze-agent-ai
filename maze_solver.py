@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from solver_environment import Action, MazeEnvironment
+from environment import Action, MazeEnvironment
 from maze_reader import DEFAULT_HAZARDS_PATH, DEFAULT_WALLS_PATH, GRID, load_maze
 
 CELL_PX = 20
@@ -38,6 +38,7 @@ DIRECTION_TO_ACTION = {
 }
 KNOWN_SAFE_TYPES = {"start", "safe", "goal", "confusion"}
 NON_STANDABLE_TYPES = {"lethal", "teleport"}
+BATCH_SAFE_TYPES = {"start", "safe", "goal"}
 
 
 def resolve_project_path(path_str):
@@ -327,10 +328,141 @@ class Agent:
             }
         )
 
+    def _record_safe_transition(self, origin, direction, destination):
+        self._record_edge(origin, direction, destination)
+        self._record_reverse_edge_if_adjacent(origin, direction, destination)
+        self._mark_cell_type(destination, "safe")
+        self.move_log.append([destination[0], destination[1]])
+        self._record_event(destination, kind="move", consumes_move=True)
+
+    def _batch_known_route(self, directions, max_actions=5):
+        batch = []
+        cursor = self.current_position
+
+        for direction in directions[:max_actions]:
+            stats = self.knowledge["cell_exits"].get(cursor, {}).get(direction)
+            if stats is None or not self._is_traversable(cursor, direction, stats):
+                break
+
+            destination = stats.get("destination")
+            if destination is None:
+                break
+
+            cell_type = self.knowledge["cell_types"].get(destination)
+            if cell_type not in BATCH_SAFE_TYPES:
+                break
+
+            batch.append((direction, destination))
+            cursor = destination
+
+            if destination == self.goal:
+                break
+
+        return batch
+
     def observe_turn_result(self, result):
         if self.pending_turn is None:
             self.current_position = self.start if result.is_dead else result.current_position
             self.controls_inverted = result.is_confused
+            return
+
+        if self.pending_turn.get("batched_steps"):
+            steps = self.pending_turn["batched_steps"]
+            executed = min(result.actions_executed, len(steps))
+            self.wall_hits += result.wall_hits
+            cursor = self.pending_turn["origin"]
+
+            if result.wall_hits > 0:
+                for index in range(max(executed - 1, 0)):
+                    direction, destination = steps[index]
+                    self._record_safe_transition(cursor, direction, destination)
+                    cursor = destination
+
+                blocked_direction = steps[min(executed, len(steps)) - 1][0] if executed else steps[0][0]
+                self._mark_wall(cursor, blocked_direction)
+                self.move_log.append([cursor[0], cursor[1]])
+                self._record_event(cursor, kind="wall", consumes_move=False)
+                self.current_position = result.current_position
+                self.controls_inverted = result.is_confused
+                self.pending_turn = None
+                return
+
+            if result.is_dead:
+                for index in range(max(executed - 1, 0)):
+                    direction, destination = steps[index]
+                    self._record_safe_transition(cursor, direction, destination)
+                    cursor = destination
+
+                death_direction, attempted_cell = steps[executed - 1]
+                self._record_edge(cursor, death_direction, attempted_cell, died=True)
+                self._mark_cell_type(attempted_cell, "lethal")
+                self.deaths += 1
+                self.move_log.append([attempted_cell[0], attempted_cell[1]])
+                self._record_event(attempted_cell, kind="death", consumes_move=True)
+                self.move_log.append([self.start[0], self.start[1]])
+                self._record_event(self.start, kind="respawn", consumes_move=False)
+                self.current_position = self.start
+                self.controls_inverted = False
+                self.pending_turn = None
+                return
+
+            if result.teleported or result.is_confused:
+                for index in range(max(executed - 1, 0)):
+                    direction, destination = steps[index]
+                    self._record_safe_transition(cursor, direction, destination)
+                    cursor = destination
+
+                final_direction, attempted_cell = steps[executed - 1]
+                self._record_edge(cursor, final_direction, result.current_position)
+
+                if result.teleported:
+                    self.teleports += 1
+                    self._mark_cell_type(attempted_cell, "teleport")
+                else:
+                    self._record_reverse_edge_if_adjacent(cursor, final_direction, result.current_position)
+
+                if result.is_confused:
+                    self.confusion_entries += 1
+                    self._mark_cell_type(result.current_position, "confusion")
+                else:
+                    self._mark_cell_type(result.current_position, "safe")
+
+                self.move_log.append([result.current_position[0], result.current_position[1]])
+                self._record_event(
+                    result.current_position,
+                    kind="teleport" if result.teleported else "move",
+                    consumes_move=True,
+                    teleported=result.teleported,
+                    confused=result.is_confused,
+                    goal_reached=result.is_goal_reached,
+                )
+                self.current_position = result.current_position
+                self.controls_inverted = result.is_confused
+                self.pending_turn = None
+                return
+
+            for index in range(executed):
+                direction, destination = steps[index]
+                self._record_edge(cursor, direction, destination)
+                self._record_reverse_edge_if_adjacent(cursor, direction, destination)
+                if index == executed - 1 and result.is_goal_reached:
+                    self._mark_cell_type(destination, "goal")
+                    self.move_log.append([destination[0], destination[1]])
+                    self._record_event(
+                        destination,
+                        kind="move",
+                        consumes_move=True,
+                        goal_reached=True,
+                    )
+                else:
+                    self._mark_cell_type(destination, "safe")
+                    self.move_log.append([destination[0], destination[1]])
+                    self._record_event(destination, kind="move", consumes_move=True)
+                cursor = destination
+
+            self.current_position = result.current_position
+            self.controls_inverted = result.is_confused
+            self.pending_turn = None
             return
 
         origin = self.pending_turn["origin"]
@@ -398,12 +530,30 @@ class Agent:
 
         route_to_goal = self._route_to({self.goal})
         if route_to_goal:
+            batched_route = self._batch_known_route(route_to_goal)
+            if len(batched_route) > 1:
+                directions = [direction for direction, _ in batched_route]
+                issued_actions = [self._encode_action(direction) for direction in directions]
+                self.pending_turn = {
+                    "origin": self.current_position,
+                    "batched_steps": batched_route,
+                }
+                return issued_actions
             chosen_direction = route_to_goal[0]
         else:
             chosen_direction = self._best_unknown_direction(self.current_position)
             if chosen_direction is None:
                 route_to_frontier = self._route_to(self._frontier_cells())
                 if route_to_frontier:
+                    batched_route = self._batch_known_route(route_to_frontier)
+                    if len(batched_route) > 1:
+                        directions = [direction for direction, _ in batched_route]
+                        issued_actions = [self._encode_action(direction) for direction in directions]
+                        self.pending_turn = {
+                            "origin": self.current_position,
+                            "batched_steps": batched_route,
+                        }
+                        return issued_actions
                     chosen_direction = route_to_frontier[0]
 
         if chosen_direction is None:
@@ -596,7 +746,7 @@ def render_path(h_walls, v_walls, path, start, goal, run_number, *, optimized):
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the spec-aligned maze solver.")
     parser.add_argument("--episodes", type=int, default=1, help="Number of evaluation episodes to run.")
-    parser.add_argument("--max-turns", type=int, default=20000, help="Hard turn cap per episode.")
+    parser.add_argument("--max-turns", type=int, default=10000, help="Hard turn cap per episode.")
     parser.add_argument("--walls", default=DEFAULT_WALLS_PATH, help="Wall image path, relative to the project root by default.")
     parser.add_argument("--hazards", default=DEFAULT_HAZARDS_PATH, help="Hazard image path, relative to the project root by default.")
     parser.add_argument("--teleports", default=None, help="Optional teleport mapping JSON for non-paired deterministic teleport layouts.")
@@ -612,9 +762,13 @@ def main():
     hazards_path = resolve_project_path(args.hazards)
     knowledge_path = resolve_project_path(args.knowledge)
     teleport_path = resolve_project_path(args.teleports) if args.teleports else None
+    if teleport_path is None:
+        sibling_teleports = hazards_path.parent / "teleports.json"
+        if sibling_teleports.exists():
+            teleport_path = sibling_teleports
 
     knowledge = fresh_knowledge_state() if args.reset_knowledge else load_knowledge(knowledge_path)
-    current_teleport_model = "explicit-map" if teleport_path else "asset-paired-fallback"
+    current_teleport_model = "explicit-map" if teleport_path else "asset-one-way-fallback"
     prior_metadata = knowledge.get("metadata", {})
     if (
         prior_metadata.get("walls_path")

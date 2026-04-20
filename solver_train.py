@@ -69,7 +69,7 @@ def parse_args():
         help="Hazard image path, relative to the project root by default.",
     )
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to run.")
-    parser.add_argument("--max-turns", type=int, default=20000, help="Hard turn cap per episode.")
+    parser.add_argument("--max-turns", type=int, default=10000, help="Hard turn cap per episode.")
     parser.add_argument(
         "--knowledge",
         default=None,
