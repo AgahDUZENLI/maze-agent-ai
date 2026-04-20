@@ -1,200 +1,167 @@
 """
-visualizer.py
-=============
-Draws the agent's episode onto the maze image and saves a JPEG.
+Legacy compatibility visualizer for the upstream repository layout.
 
-Shows:
-  - Maze walls (from original PNG)
-  - Green cells  = visited this episode
-  - Blue path    = the exact route the agent took
-  - Red X        = where the agent died (fire)
-  - Gold star    = goal location
-  - Cyan dot     = start location
-  - Orange cells = known teleporter cells
-  - Purple cells = known confusion traps
-  - Fire cells   = current fire positions (from environment)
-
-Usage:
-    from visualizer import MazeVisualizer
-    viz = MazeVisualizer("MAZE_0.png")
-    viz.save_episode(episode_num, agent, env, path_taken)
+This file keeps the old `visualizer.py` entry point available for static episode
+snapshots. The official replay renderer remains `maze_visualizer.py`.
 """
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from typing import List, Tuple, Set, Dict, Optional
+from pathlib import Path
 
-# Must match maze_reader.py exactly
-GRID  = 64
-WALL  = 2
-STEP  = 16
+from PIL import Image, ImageDraw
+
+from maze_reader import Hazard, update_fire_in_hazards
+
+GRID = 64
+WALL = 2
+STEP = 16
 INNER = 14
 
 
-def cell_to_pixel(row: int, col: int) -> Tuple[int, int]:
-    """Return top-left pixel (x, y) of a cell."""
+def cell_to_pixel(row, col):
     x = WALL + col * STEP
     y = WALL + row * STEP
     return x, y
 
 
-def cell_center_px(row: int, col: int) -> Tuple[int, int]:
-    """Return center pixel (x, y) of a cell."""
+def cell_center_px(row, col):
     x = WALL + col * STEP + STEP // 2
     y = WALL + row * STEP + STEP // 2
     return x, y
 
 
 class MazeVisualizer:
-    def __init__(self, maze_path: str):
+    def __init__(self, maze_path):
         self.maze_path = maze_path
-        # Load original maze image as base
         self.base_image = Image.open(maze_path).convert("RGB")
 
-    def _fresh_canvas(self) -> Image.Image:
-        """Return a fresh copy of the maze image to draw on."""
+    def _fresh_canvas(self):
         return self.base_image.copy()
+
+    def _display_hazards(self, base_hazards, path_taken, events):
+        hazards = dict(base_hazards)
+        fire_pivots = None
+        fire_rotations = 0
+
+        if events:
+            consumed_moves = 0
+            for event in events:
+                if not event.get("consumes_move", False):
+                    continue
+                consumed_moves += 1
+                if consumed_moves % 5 == 0:
+                    hazards, fire_pivots = update_fire_in_hazards(hazards, fire_pivots)
+                    fire_rotations += 1
+            return hazards, fire_rotations
+
+        # Fall back to path length when no event log is available.
+        for _ in range(max(0, len(path_taken) - 1) // 5):
+            hazards, fire_pivots = update_fire_in_hazards(hazards, fire_pivots)
+            fire_rotations += 1
+
+        return hazards, fire_rotations
 
     def save_episode(
         self,
-        episode_num:  int,
-        agent,                    # HybridAgent instance
-        env,                      # MazeEnvironment instance
-        path_taken:   List[Tuple[int, int]],   # list of (row,col) positions this episode
-        death_cells:  List[Tuple[int, int]],   # where agent died this episode
-        output_dir:   str = ".",
+        episode_num,
+        agent,
+        env,
+        path_taken,
+        death_cells,
+        events=None,
+        rotate_fire=True,
+        output_dir=".",
     ):
-        """
-        Draw the episode and save as JPEG.
+        image = self._fresh_canvas()
+        draw = ImageDraw.Draw(image, "RGBA")
 
-        Parameters
-        ----------
-        episode_num  : episode number (used in filename)
-        agent        : the HybridAgent (for map knowledge)
-        env          : the MazeEnvironment (for fire positions, goal, start)
-        path_taken   : ordered list of (row,col) the agent actually visited
-        death_cells  : list of (row,col) where agent died this episode
-        output_dir   : folder to save the image
-        """
-        img  = self._fresh_canvas()
-        draw = ImageDraw.Draw(img, "RGBA")
-
-        cell_size = STEP   # pixels per cell (16)
-        inner     = INNER  # inner cell size (14)
-
-        # ── Helper: fill a cell with a color ──────────────────────────────────
         def fill_cell(row, col, color):
             x, y = cell_to_pixel(row, col)
-            # Draw inside the cell, leaving wall pixels intact
-            draw.rectangle(
-                [x + 1, y + 1, x + inner, y + inner],
-                fill=color
+            draw.rectangle([x + 1, y + 1, x + INNER, y + INNER], fill=color)
+
+        known_cells = getattr(agent, "knowledge", {}).get("cell_types", {})
+        display_hazards = dict(env.hazards)
+        fire_rotations = 0
+
+        if rotate_fire:
+            display_hazards, fire_rotations = self._display_hazards(
+                env.hazards,
+                path_taken,
+                events,
             )
 
-        # ── 1. Visited cells (light green, semi-transparent) ──────────────────
-        for (r, c) in agent.visited:
-            fill_cell(r, c, (144, 238, 144, 80))   # light green, 80/255 alpha
+        for (row, col), cell_type in known_cells.items():
+            if cell_type in {"start", "safe", "goal"}:
+                fill_cell(row, col, (144, 238, 144, 80))
+            elif cell_type == "confusion":
+                fill_cell(row, col, (180, 0, 255, 140))
+            elif cell_type == "teleport":
+                fill_cell(row, col, (255, 165, 0, 160))
+            elif cell_type == "lethal":
+                fill_cell(row, col, (255, 110, 110, 120))
 
-        # ── 2. Current fire positions (red-orange) ────────────────────────────
-        from maze_reader import Hazard
-        for (r, c), hz in env.hazards.items():
-            if hz == Hazard.FIRE:
-                fill_cell(r, c, (255, 80, 0, 160))   # orange-red
+        for (row, col), hazard in display_hazards.items():
+            if hazard == Hazard.FIRE:
+                fill_cell(row, col, (255, 80, 0, 150))
 
-        # ── 3. Known confusion cells (purple) ─────────────────────────────────
-        for (r, c) in agent.confuse:
-            fill_cell(r, c, (180, 0, 255, 140))   # purple
-
-        # ── 4. Known teleporter cells (orange) ────────────────────────────────
-        for (r, c), dest in agent.teleports.items():
-            fill_cell(r, c, (255, 165, 0, 160))   # orange
-
-        # ── 5. Path taken this episode (blue line) ────────────────────────────
         if len(path_taken) >= 2:
-            # Draw line connecting each step
-            pixel_path = [cell_center_px(r, c) for r, c in path_taken]
-            for i in range(len(pixel_path) - 1):
+            pixel_path = [cell_center_px(row, col) for row, col in path_taken]
+            for index in range(len(pixel_path) - 1):
                 draw.line(
-                    [pixel_path[i], pixel_path[i+1]],
-                    fill=(30, 144, 255, 200),   # dodger blue
-                    width=2
+                    [pixel_path[index], pixel_path[index + 1]],
+                    fill=(30, 144, 255, 210),
+                    width=2,
                 )
 
-        # ── 6. Death locations (red X) ────────────────────────────────────────
-        for (r, c) in death_cells:
-            cx, cy = cell_center_px(r, c)
-            s = 4   # size of X arms
-            draw.line([(cx-s, cy-s), (cx+s, cy+s)], fill=(220, 0, 0), width=2)
-            draw.line([(cx+s, cy-s), (cx-s, cy+s)], fill=(220, 0, 0), width=2)
+        for row, col in death_cells:
+            cx, cy = cell_center_px(row, col)
+            size = 4
+            draw.line([(cx - size, cy - size), (cx + size, cy + size)], fill=(220, 0, 0), width=2)
+            draw.line([(cx + size, cy - size), (cx - size, cy + size)], fill=(220, 0, 0), width=2)
 
-        # ── 7. Start cell (cyan dot) ───────────────────────────────────────────
-        sr, sc = env.start
-        cx, cy = cell_center_px(sr, sc)
-        draw.ellipse([(cx-4, cy-4), (cx+4, cy+4)], fill=(0, 255, 255))
+        start_row, start_col = env.start
+        goal_row, goal_col = env.goal
+        start_cx, start_cy = cell_center_px(start_row, start_col)
+        goal_cx, goal_cy = cell_center_px(goal_row, goal_col)
+        draw.ellipse([(start_cx - 4, start_cy - 4), (start_cx + 4, start_cy + 4)], fill=(0, 255, 255))
+        draw.ellipse([(goal_cx - 5, goal_cy - 5), (goal_cx + 5, goal_cy + 5)], fill=(255, 215, 0))
 
-        # ── 8. Goal cell (gold star / filled circle) ───────────────────────────
-        gr, gc = env.goal
-        cx, cy = cell_center_px(gr, gc)
-        draw.ellipse([(cx-5, cy-5), (cx+5, cy+5)], fill=(255, 215, 0))
+        current_row, current_col = path_taken[-1] if path_taken else env.start
+        current_cx, current_cy = cell_center_px(current_row, current_col)
+        draw.ellipse([(current_cx - 3, current_cy - 3), (current_cx + 3, current_cy + 3)], fill=(255, 255, 255))
 
-        # ── 9. Current agent position (white dot) ─────────────────────────────
-        if agent.current_pos:
-            ar, ac = agent.current_pos
-            cx, cy = cell_center_px(ar, ac)
-            draw.ellipse([(cx-3, cy-3), (cx+3, cy+3)], fill=(255, 255, 255))
-
-        # ── 10. Legend text ───────────────────────────────────────────────────
-        # Draw a small legend in the top-left corner
         legend_x, legend_y = 4, 4
         legend_items = [
-            ((144, 238, 144), "visited"),
-            ((30, 144, 255),  "path"),
-            ((255, 80, 0),    "fire"),
-            ((220, 0, 0),     "death"),
-            ((0, 255, 255),   "start"),
-            ((255, 215, 0),   "goal"),
-            ((180, 0, 255),   "confusion"),
-            ((255, 165, 0),   "teleport"),
+            ((144, 238, 144), "known"),
+            ((30, 144, 255), "path"),
+            ((255, 80, 0), "fire"),
+            ((220, 0, 0), "death"),
+            ((0, 255, 255), "start"),
+            ((255, 215, 0), "goal"),
+            ((180, 0, 255), "confusion"),
+            ((255, 165, 0), "teleport"),
         ]
-
-        # Semi-transparent legend background
         legend_h = len(legend_items) * 10 + 6
-        draw.rectangle(
-            [legend_x, legend_y, legend_x + 72, legend_y + legend_h],
-            fill=(0, 0, 0, 160)
+        draw.rectangle([legend_x, legend_y, legend_x + 74, legend_y + legend_h], fill=(0, 0, 0, 160))
+        for index, (color, label) in enumerate(legend_items):
+            y = legend_y + 4 + index * 10
+            draw.rectangle([legend_x + 2, y, legend_x + 8, y + 7], fill=color)
+            draw.text((legend_x + 11, y), label, fill=(255, 255, 255))
+
+        image_w, image_h = image.size
+        footer = (
+            f"Ep {episode_num} | cells={len(known_cells)} | "
+            f"deaths={len(death_cells)} | fire turns={fire_rotations} | "
+            f"goal={'FOUND' if known_cells.get(env.goal) == 'goal' else 'not found'}"
         )
+        draw.rectangle([0, image_h - 14, image_w, image_h], fill=(0, 0, 0, 200))
+        draw.text((4, image_h - 12), footer, fill=(255, 255, 255))
 
-        for i, (color, label) in enumerate(legend_items):
-            y = legend_y + 4 + i * 10
-            # Color swatch
-            draw.rectangle([legend_x+2, y, legend_x+8, y+7], fill=color)
-            # Label (draw without font — just use default)
-            draw.text((legend_x+11, y), label, fill=(255, 255, 255))
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / f"episode_{episode_num:03d}.jpg"
+        image.convert("RGB").save(out_path, "JPEG", quality=92)
+        print(f"  [legacy-viz] Saved -> {out_path}")
+        return str(out_path)
 
-        # ── 11. Episode info header ────────────────────────────────────────────
-        # Draw episode number and stats at bottom
-        m           = agent.get_metrics()
-        stats_text  = (
-            f"Ep {episode_num} | "
-            f"cells={len(agent.visited)} | "
-            f"deaths={len(death_cells)} | "
-            f"goal={'FOUND' if agent.goal_pos else 'not found'} | "
-            f"success={m['success_rate']}%"
-        )
 
-        # Background strip at bottom
-        img_w, img_h = img.size
-        draw.rectangle(
-            [0, img_h - 14, img_w, img_h],
-            fill=(0, 0, 0, 200)
-        )
-        draw.text((4, img_h - 12), stats_text, fill=(255, 255, 255))
-
-        # ── Save ──────────────────────────────────────────────────────────────
-        import os
-        os.makedirs(output_dir, exist_ok=True)
-        out_path = os.path.join(output_dir, f"episode_{episode_num:03d}.jpg")
-        img.convert("RGB").save(out_path, "JPEG", quality=92)
-        print(f"  [VIZ] Saved → {out_path}")
-
-        return out_path
+__all__ = ["MazeVisualizer"]

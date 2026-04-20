@@ -2,8 +2,8 @@
 maze_reader.py
 ==============
 Loads and inspects a maze image pair:
-  - MAZE_0.png  →  wall layout
-  - MAZE_1.png  →  hazard overlay
+  - TestMazes/maze-alpha/MAZE_0.png  →  wall layout
+  - TestMazes/maze-alpha/MAZE_1.png  →  hazard overlay
 
 Public API
 ----------
@@ -31,6 +31,7 @@ update_fire_in_hazards(hazards)           → updated hazards dict
 
 from collections import Counter
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -42,6 +43,9 @@ GRID  = 64   # cells per side
 WALL  = 2    # wall-strip width in pixels
 STEP  = 16   # pixels per cell (wall shared between neighbours)
 INNER = 14   # usable inner-cell size in pixels
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_WALLS_PATH = "TestMazes/maze-alpha/MAZE_0.png"
+DEFAULT_HAZARDS_PATH = "TestMazes/maze-alpha/MAZE_1.png"
 
 # ---------------------------------------------------------------------------
 # Actions & directions
@@ -70,15 +74,6 @@ HAZARD_LABELS = {
     Hazard.TP_RED:     "TP_RED",
 }
 
-HAZARD_LABELS = {
-    Hazard.FIRE:      "FIRE",
-    Hazard.CONFUSION: "CONFUSION",
-    Hazard.TP_GREEN:  "TP_GREEN",
-    Hazard.TP_YELLOW: "TP_YELLOW",
-    Hazard.TP_PURPLE: "TP_PURPLE",
-    Hazard.TP_RED:     "TP_RED",
-}
-
 # ---------------------------------------------------------------------------
 # Coordinate helpers
 # ---------------------------------------------------------------------------
@@ -92,8 +87,8 @@ def cell_center(row, col):
 # ---------------------------------------------------------------------------
 # Wall loading
 # ---------------------------------------------------------------------------
-def load_maze(path="MAZE_0.png"):
-    image = np.array(Image.open(path).convert("RGB"))
+def load_maze(path=DEFAULT_WALLS_PATH):
+    image = np.array(Image.open(BASE_DIR / path).convert("RGB"))
     black = np.zeros(3, dtype=np.uint8)
 
     v_walls = np.full((GRID, GRID + 1), False)
@@ -162,7 +157,7 @@ def _classify_color(r, g, b):
     return None
 
 
-def load_hazards(path="MAZE_1.png"):
+def load_hazards(path=DEFAULT_HAZARDS_PATH):
     """
     Detect hazard type for every cell by sampling a 10×10 pixel patch
     around the cell centre, filtering out background pixels, then
@@ -172,7 +167,7 @@ def load_hazards(path="MAZE_1.png"):
     -------
     hazards : dict  {(row, col): Hazard}
     """
-    img = np.array(Image.open(path).convert("RGB"))
+    img = np.array(Image.open(BASE_DIR / path).convert("RGB"))
     hazards = {}
 
     for row in range(GRID):
@@ -515,10 +510,10 @@ def print_summary(h_walls, hazards):
 # Entry point – run as script for a quick inspection
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Loading maze walls from MAZE_0.png...")
-    image, h_walls, v_walls = load_maze("MAZE_0.png")
+    print(f"Loading maze walls from {DEFAULT_WALLS_PATH}...")
+    image, h_walls, v_walls = load_maze(DEFAULT_WALLS_PATH)
 
-    print("Loading hazards from MAZE_1.png...")
-    hazards = load_hazards("MAZE_1.png")
+    print(f"Loading hazards from {DEFAULT_HAZARDS_PATH}...")
+    hazards = load_hazards(DEFAULT_HAZARDS_PATH)
 
     print_summary(h_walls, hazards)

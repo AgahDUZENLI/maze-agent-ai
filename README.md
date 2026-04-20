@@ -1,131 +1,168 @@
-# 🧩 Blind Maze Agent
+# Blind Maze Agent
 
-A blind AI agent that learns to navigate a dynamic maze through exploration and memory. The agent starts with zero map knowledge and improves its route across multiple runs using greedy search and A*.
+This repository contains the current spec-aligned maze solver and replay tools.
 
----
+The project now relies on the maze assets under `TestMazes/`. The default asset pair used by the tools is `TestMazes/maze-alpha/`.
 
-## How It Works
+The active runtime is:
 
-### Run 1 — Blind Greedy Exploration
-The agent knows only its start position and the goal coordinates. It has no map.
+- `environment.py`: defines `Action`, `TurnResult`, and `MazeEnvironment.step(actions)`
+- `maze_solver.py`: implements the agent and evaluation loop
+- `maze_reader.py`: loads walls and hazards from the PNG assets
+- `maze_printer.py`: renders the main annotated maze outputs
+- `maze_visualizer.py`: renders replay GIFs from saved run data
 
-At every new cell it **senses all 4 directions** by querying the maze, then saves which ones are open to a JSON memory file. It picks the next direction using two priorities:
+Compatibility entry points restored from the upstream repository layout:
 
-1. **Unexplored first** — bonus for directions never tried before
-2. **Closest to goal** — Manhattan distance `|row_diff| + |col_diff|` as a tiebreaker
+- `agent.py`: compatibility wrapper around the current solver agent
+- `train.py`: upstream-style runner that still uses the current environment and knowledge format
+- `visualizer.py`: legacy static episode snapshot renderer; replay GIFs still belong to `maze_visualizer.py`
 
-This is a greedy approach — it only scores the immediate next step, not the full path. The agent will hit dead ends and backtrack. That's expected. The goal of run 1 is to **survive and collect the map**.
+The solver updates its knowledge only from turn feedback. It does not inspect the maze state directly while solving.
 
-### Run 2+ — A* on Known Map
-The agent loads its JSON memory from the previous run. It now has a partial or full map of cell exits. It runs **A\*** over that map to find the shortest path.
+## Search Strategy
 
-A\* is smarter than greedy because:
-- Greedy only asks: *"how far am I from the goal right now?"*
-- A\* asks: *"how far did I travel to get here + how far is the goal?"*
+The current agent uses a partial-observation frontier strategy:
 
-This means A\* always finds the **optimal route** through the known map and never wastes steps chasing dead ends.
+- greedy probing for unknown adjacent directions
+- BFS over the learned safe graph when routing to the goal
+- BFS over the learned safe graph when routing to the nearest reachable frontier
 
-If A\* can't find a complete path (undiscovered sections), the agent falls back to greedy exploration to fill in the gaps.
+In short: it explores locally with a simple heuristic, and it navigates known territory with BFS.
 
----
+## Current Behavior
 
-## Hazards
+- The agent starts with only the start and goal coordinates.
+- It sends actions through `MazeEnvironment.step(...)`.
+- The active solver intentionally uses one move per turn so every wall hit, death, teleport, and confusion event can be attributed exactly.
+- Run knowledge is saved to JSON and reused across episodes for the same maze.
 
-The maze contains dynamic hazards that change each turn:
+Saved knowledge includes:
 
-| Icon | Type | Effect |
-|------|------|--------|
-| 🔥 | Fire | Kills the agent — respawn at start |
-| 🟡 | Teleport Yellow | Teleports to paired yellow cell |
-| 🟢 | Teleport Green | Teleports to paired green cell |
-| 🟣 | Teleport Purple | Teleports to paired purple cell |
-| ❄️ | Confusion | Randomizes next move direction |
+- discovered exits with visit/death counts and destinations
+- confirmed wall directions
+- inferred cell types such as `safe`, `confusion`, `teleport`, `goal`, and `lethal`
+- per-step replay `events` so the visualizer can reconstruct run semantics accurately
 
-Fire spreads every **even turn** (map's turn). The agent moves up to **5 steps per odd turn**.
+## Metrics
 
----
+`maze_solver.py` reports:
 
-## Scoring & Decision Logic
+- success rate
+- average turns
+- average path length
+- average deaths
+- average wall hits
+- average exploration efficiency
 
-Each direction from a cell is scored as:
+Exploration efficiency is:
 
+```text
+cells_explored / total_cells_visited
 ```
-score = manhattan_distance + (danger * DANGER_WEIGHT) - (unexplored_bonus)
 
-danger          = deaths / (visits + 1)
-unexplored_bonus = 10 if visits == 0 else 0
-DANGER_WEIGHT   = 5
+## Running The Solver
+
+Default maze:
+
+```bash
+python3 maze_solver.py
 ```
 
-Directions with high death counts are avoided but not permanently banned — since fire moves, a previously deadly path may be safe next run.
+Single fresh run on each test maze:
 
----
+```bash
+python3 maze_solver.py --walls "TestMazes/maze-alpha/MAZE_0.png" --hazards "TestMazes/maze-alpha/MAZE_1.png" --episodes 1 --reset-knowledge --knowledge "results/maze-alpha.json" --no-render
+python3 maze_solver.py --walls "TestMazes/maze-beta/MAZE_0.png" --hazards "TestMazes/maze-beta/MAZE_1.png" --episodes 1 --reset-knowledge --knowledge "results/maze-beta.json" --no-render
+python3 maze_solver.py --walls "TestMazes/maze-gamma/MAZE_0.png" --hazards "TestMazes/maze-gamma/MAZE_1.png" --episodes 1 --reset-knowledge --knowledge "results/maze-gamma.json" --no-render
+```
 
-## Memory Format
+Multiple episodes:
 
-All knowledge is persisted to `results/maze_knowledge.json`:
+```bash
+python3 maze_solver.py --episodes 5
+```
+
+Optional explicit teleport mapping:
+
+```bash
+python3 maze_solver.py --teleports teleports.json
+```
+
+Expected JSON format:
 
 ```json
 {
-  "runs": 3,
-  "cell_exits": {
-    "(1, 1)": {
-      "up":    { "visits": 3, "deaths": 1 },
-      "right": { "visits": 2, "deaths": 0 }
-    }
-  },
-  "move_history": [
-    { "run": 1, "moves": [[1,2],[1,3],...] }
-  ]
+  "12,7": [40, 11],
+  "40,11": [12, 7]
 }
 ```
 
-- **visits** — how many times the agent moved in that direction from that cell
-- **deaths** — how many times it died doing so
-- Knowledge is **never overwritten** — merges use `max()` so no information is lost across runs
+## Rendering Annotated Maze Outputs
 
----
+`maze_printer.py` is the primary static visualization tool for the project.
 
-## Project Structure
-
-```
-maze-agent-ai/
-├── maze_solver.py       # Agent, World, save/load, render
-├── maze_reader.py       # Maze parser, hazard loader, wall logic
-├── MAZE_0.png           # Maze walls image
-├── MAZE_1.png           # Hazards overlay image
-└── results/
-    ├── maze_knowledge.json        # Persistent agent memory
-    ├── path_run1_blind.png        # Red path — full blind run with step numbers
-    └── path_run1_optimized.png    # Blue path — clean shortest route
-```
-
----
-
-## Output Maps
-
-After every run two PNGs are saved to `results/`:
-
-- **`_blind.png`** — Red path showing every step the agent took, including backtracks and deaths. Step numbers are printed on each cell.
-- **`_optimized.png`** — Blue path showing only the final route from start to goal. Rendered only on successful runs.
-
----
-
-## Running
+Default maze:
 
 ```bash
-python maze_solver.py
+python3 maze_printer.py
 ```
 
-Run it multiple times on the same maze. Each run loads the previous memory and gets faster. To start fresh, delete `results/maze_knowledge.json`.
+Per-test-maze annotated outputs:
 
----
+```bash
+python3 maze_printer.py --walls "TestMazes/maze-alpha/MAZE_0.png" --hazards "TestMazes/maze-alpha/MAZE_1.png"
+python3 maze_printer.py --walls "TestMazes/maze-beta/MAZE_0.png" --hazards "TestMazes/maze-beta/MAZE_1.png"
+python3 maze_printer.py --walls "TestMazes/maze-gamma/MAZE_0.png" --hazards "TestMazes/maze-gamma/MAZE_1.png"
+```
 
-## Key Parameters
+By default the printer writes into:
 
-| Parameter | Default | Effect |
-|-----------|---------|--------|
-| `DANGER_WEIGHT` | `5` | How strongly the agent avoids previously deadly directions |
-| `REVISIT_WEIGHT` | `3` | Penalty for revisiting already-seen cells |
-| `MAX_TURNS` | `10,000` | Hard cutoff to prevent infinite loops |
-| `CELL_PX` | `20` | Pixel size per cell in rendered output |
+```text
+results/printer/<maze-name>/
+```
+
+It generates:
+
+- `annotated_maze.png`
+- `annotated_maze_legend.png`
+- `maze_turn_0.png ... maze_turn_N.png`
+
+`maze_visualizer.py` is kept for replay output only.
+
+## Rendering Replays
+
+Generate GIFs from saved result JSONs:
+
+```bash
+python3 maze_visualizer.py --walls "TestMazes/maze-alpha/MAZE_0.png" --hazards "TestMazes/maze-alpha/MAZE_1.png" --knowledge "results/maze-alpha.json" --output "results/visualizer/maze-alpha.gif" --no-latest-alias
+python3 maze_visualizer.py --walls "TestMazes/maze-beta/MAZE_0.png" --hazards "TestMazes/maze-beta/MAZE_1.png" --knowledge "results/maze-beta.json" --output "results/visualizer/maze-beta.gif" --no-latest-alias
+python3 maze_visualizer.py --walls "TestMazes/maze-gamma/MAZE_0.png" --hazards "TestMazes/maze-gamma/MAZE_1.png" --knowledge "results/maze-gamma.json" --output "results/visualizer/maze-gamma.gif" --no-latest-alias
+```
+
+Replay behavior:
+
+- By default, the visualizer rotates fire for display using the project turn cadence.
+- `--static-fire` is a display override that shows the saved run hazards instead.
+- The HUD and CLI output show both the run hazard model and the display hazard model.
+
+## Current Maze Results
+
+Fresh single-episode runs on the normalized test mazes:
+
+| Maze | Result | Turns | Steps | Deaths | Wall Hits |
+|------|--------|------:|------:|-------:|----------:|
+| `maze-alpha` | Success | 8398 | 4513 | 6 | 3885 |
+| `maze-beta` | Failed | 1222 | 633 | 3 | 589 |
+| `maze-gamma` | Failed | 10228 | 5933 | 17 | 4295 |
+
+## Assumptions And Limits
+
+Two important limits still come from the provided PNG assets:
+
+1. The images do not encode arbitrary teleport graph metadata. Without an explicit JSON mapping, teleports fall back to color-paired behavior.
+2. The active solver uses the static/spec-style hazard interpretation. The visualizer rotates fire for presentation by default, but that does not change the saved run semantics.
+
+## AI Usage Disclosure
+
+AI assistance was used during development to inspect the repository, compare the implementation against the assignment specification, and help draft/refactor code and documentation. Final code changes were reviewed and executed locally in this repository.

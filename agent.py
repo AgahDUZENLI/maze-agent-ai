@@ -1,377 +1,79 @@
-import random
-import numpy as np
-from collections import deque
-from heapq import heappush, heappop
-from typing import List, Tuple, Optional, Set, Dict
+"""
+Compatibility agent entry points for the upstream repository layout.
 
-ACTION_UP    = 0
-ACTION_DOWN  = 1
-ACTION_LEFT  = 2
-ACTION_RIGHT = 3
-ACTIONS      = [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT]
+The canonical implementation lives in `maze_solver.py`. This module restores the
+old `agent.py` import surface without forking the project into two competing
+solver implementations.
+"""
 
-INVERT = {0: 1, 1: 0, 2: 3, 3: 2}
-
-DELTAS = {
-    ACTION_UP:    (-1,  0),
-    ACTION_DOWN:  ( 1,  0),
-    ACTION_LEFT:  ( 0, -1),
-    ACTION_RIGHT: ( 0,  1),
-}
-
-GRID = 64
+from maze_reader import DEFAULT_WALLS_PATH, find_start_goal, load_maze
+from maze_solver import Agent as PartialObservationAgent
+from maze_solver import fresh_knowledge_state
 
 
-class HybridAgent:
+class HybridAgent(PartialObservationAgent):
+    """
+    Upstream-compatible wrapper around the current solver agent.
 
-    def __init__(self):
+    The original upstream repository constructed `HybridAgent()` with no
+    arguments. This wrapper keeps that workflow available while still using the
+    current partial-observation agent underneath.
+    """
 
-        # ── Permanent map (never clears) ──────────────────────────────────────
-        self.walls:     Set[Tuple] = set()   # (row, col, action)
-        self.teleports: Dict[Tuple, Tuple] = {}
-        self.confuse:   Set[Tuple] = set()
-        self.dead_cells: Set[Tuple] = set()  # clears each episode (fire moves)
+    def __init__(self, start=None, goal=None, knowledge=None, walls_path=DEFAULT_WALLS_PATH):
+        if start is None or goal is None:
+            _, h_walls, _ = load_maze(str(walls_path))
+            default_start, default_goal = find_start_goal(h_walls)
+            start = default_start if start is None else start
+            goal = default_goal if goal is None else goal
 
-        # ── Visited tracking ──────────────────────────────────────────────────
-        self.visited:         Set[Tuple] = set()  # global — for A* and metrics
-        self.episode_visited: Set[Tuple] = set()  # per-episode — for BFS frontier
+        if knowledge is None:
+            knowledge = fresh_knowledge_state()
 
-        # ── Q-table ───────────────────────────────────────────────────────────
-        self.q_table = np.zeros((GRID, GRID, 4), dtype=np.float32)
-        self.alpha   = 0.2
-        self.gamma   = 0.95
+        super().__init__(start, goal, knowledge)
 
-        # ── State ─────────────────────────────────────────────────────────────
-        self.phase        = 1
-        self.current_pos: Optional[Tuple] = None
-        self.start_pos:   Optional[Tuple] = None
-        self.goal_pos:    Optional[Tuple] = None
-        self.prev_pos:    Optional[Tuple] = None
-        self.prev_action: Optional[int]   = None
-        self.action_queue: List[int]      = []
-        self.is_confused  = False
+    def reset_episode(self, start_pos=None):
+        if start_pos is not None:
+            self.start = tuple(start_pos)
+            self.knowledge["cell_types"][self.start] = "start"
+        super().reset_episode()
 
-        # ── Metrics ───────────────────────────────────────────────────────────
-        self.total_episodes      = 0
-        self.successful_episodes = 0
-        self.total_turns_ever    = 0
-        self.total_deaths_ever   = 0
-        self.all_path_lengths:   List[int] = []
-        self.all_turns:          List[int] = []
-        self.all_deaths:         List[int] = []
-        self.episode_turns    = 0
-        self.episode_deaths   = 0
-        self.episode_confused = 0
-        self.episode_cells:   List[Tuple] = []
-        self.optimal_path:    List[int]   = []
+    def get_metrics(self):
+        known_cells = dict(self.knowledge["cell_types"])
+        wall_count = sum(len(directions) for directions in self.knowledge["walls"].values())
+        teleport_cells = sum(1 for value in known_cells.values() if value == "teleport")
+        confusion_cells = sum(1 for value in known_cells.values() if value == "confusion")
+        lethal_cells = sum(1 for value in known_cells.values() if value == "lethal")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # RESET
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def reset_episode(self, start_pos: Tuple) -> None:
-        self.start_pos        = start_pos
-        self.current_pos      = start_pos
-        self.prev_pos         = None
-        self.prev_action      = None
-        self.action_queue     = []
-        self.is_confused      = False
-        self.dead_cells       = set()          # fire rotates each episode
-        self.episode_visited  = {start_pos}   # BFS frontier resets each episode
-        self.visited.add(start_pos)
-        self.episode_turns    = 0
-        self.episode_deaths   = 0
-        self.episode_confused = 0
-        self.episode_cells    = [start_pos]
-        self.total_episodes  += 1
-
-        if self.phase == 2 and self.goal_pos is not None:
-            self.action_queue = self._astar(self.start_pos, self.goal_pos)
-            self.optimal_path = list(self.action_queue)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # MAP
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _in_bounds(self, r: int, c: int) -> bool:
-        return 0 <= r < GRID and 0 <= c < GRID
-
-    def _can_move(self, r: int, c: int, a: int, ignore_fire=False) -> bool:
-        if (r, c, a) in self.walls:
-            return False
-        dr, dc = DELTAS[a]
-        nr, nc = r + dr, c + dc
-        if not self._in_bounds(nr, nc):
-            return False
-        if not ignore_fire and (nr, nc) in self.dead_cells:
-            return False
-        return True
-
-    def _neighbors(self, r: int, c: int, ignore_fire=False) -> List[Tuple]:
-        out = []
-        for a in ACTIONS:
-            if self._can_move(r, c, a, ignore_fire):
-                dr, dc = DELTAS[a]
-                nr, nc = r + dr, c + dc
-                if (nr, nc) in self.teleports:
-                    nr, nc = self.teleports[(nr, nc)]
-                out.append((nr, nc, a))
-        return out
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 1 — Biased BFS toward top of maze
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _bfs_explore(self, ignore_fire=False) -> List[int]:
-        """
-        BFS to nearest unvisited cell THIS episode.
-
-        The priority queue is sorted by (row, distance) so cells closer
-        to row 0 (the top, where the goal lives) are preferred when two
-        frontiers are equally distant. This makes the agent naturally
-        drift upward toward the exit instead of wandering randomly.
-        """
-        if self.current_pos is None:
-            return []
-
-        # heap: (priority, distance, position, path)
-        # priority = row of destination (lower row = closer to top = better)
-        heap = [(self.current_pos[0], 0, self.current_pos, [])]
-        best: Dict[Tuple, int] = {self.current_pos: 0}
-
-        while heap:
-            _, dist, (r, c), path = heappop(heap)
-
-            for nr, nc, action in self._neighbors(r, c, ignore_fire):
-                nd = dist + 1
-                if best.get((nr, nc), 999999) <= nd:
-                    continue
-                best[(nr, nc)] = nd
-                new_path = path + [action]
-
-                if (nr, nc) not in self.episode_visited:
-                    return new_path   # found nearest unvisited, biased upward
-
-                heappush(heap, (nr, nd, (nr, nc), new_path))
-
-        return []
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 2 — A*
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _astar(self, start: Tuple, goal: Tuple, ignore_fire=True) -> List[int]:
-        if not start or not goal:
-            return []
-
-        def h(r, c):
-            return abs(r - goal[0]) + abs(c - goal[1])
-
-        heap   = [(h(*start), 0, start, [])]
-        best_g: Dict[Tuple, int] = {}
-
-        while heap:
-            _, g, (r, c), path = heappop(heap)
-
-            if (r, c) == goal:
-                return path
-
-            if best_g.get((r, c), 999999) <= g:
-                continue
-            best_g[(r, c)] = g
-
-            for nr, nc, a in self._neighbors(r, c, ignore_fire):
-                ng = g + 1
-                if best_g.get((nr, nc), 999999) <= ng:
-                    continue
-                heappush(heap, (ng + h(nr, nc), ng, (nr, nc), path + [a]))
-
-        return []
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Q-TABLE
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _update_q(self, prev, action, reward, new):
-        r, c   = prev
-        nr, nc = new
-        old    = self.q_table[r, c, action]
-        best_n = float(np.max(self.q_table[nr, nc]))
-        self.q_table[r, c, action] = old + self.alpha * (reward + self.gamma * best_n - old)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PROCESS RESULT
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _process_result(self, result) -> None:
-        new_pos = result.current_position
-
-        # ── WALL ──────────────────────────────────────────────────────────────
-        if result.wall_hits > 0 and self.prev_pos and self.prev_action is not None:
-            self.walls.add((*self.prev_pos, self.prev_action))
-            dr, dc = DELTAS[self.prev_action]
-            nr, nc = self.prev_pos[0] + dr, self.prev_pos[1] + dc
-            if self._in_bounds(nr, nc):
-                self.walls.add((nr, nc, INVERT[self.prev_action]))
-            if self.phase == 1:
-                self._update_q(self.prev_pos, self.prev_action, -2, self.prev_pos)
-            self.action_queue = []
-            return  # didn't move
-
-        # ── DEATH ─────────────────────────────────────────────────────────────
-        if result.is_dead:
-            self.dead_cells.add(new_pos)
-            if self.phase == 1 and self.prev_pos and self.prev_action is not None:
-                self._update_q(self.prev_pos, self.prev_action, -100, new_pos)
-                self.q_table[new_pos[0], new_pos[1], :] = -200.0
-            self.episode_deaths    += 1
-            self.total_deaths_ever += 1
-            self.current_pos        = self.start_pos
-            self.action_queue       = []
-            if self.phase == 2 and self.goal_pos:
-                self.action_queue = self._astar(self.start_pos, self.goal_pos)
-            return
-
-        # ── TELEPORT ──────────────────────────────────────────────────────────
-        if result.teleported and self.prev_pos and self.prev_action is not None:
-            dr, dc   = DELTAS[self.prev_action]
-            pad      = (self.prev_pos[0] + dr, self.prev_pos[1] + dc)
-            if pad != new_pos:
-                self.teleports[pad]     = new_pos
-                self.teleports[new_pos] = pad
-            self.action_queue = []
-            if self.phase == 2 and self.goal_pos:
-                self.action_queue = self._astar(new_pos, self.goal_pos)
-
-        # ── CONFUSION ─────────────────────────────────────────────────────────
-        if result.is_confused:
-            self.is_confused = not self.is_confused
-            self.confuse.add(new_pos)
-            self.episode_confused += 1
-            if self.phase == 1 and self.prev_pos and self.prev_action is not None:
-                self._update_q(self.prev_pos, self.prev_action, -5, new_pos)
-            self.action_queue = []
-
-        # ── GOAL ──────────────────────────────────────────────────────────────
-        if result.is_goal_reached:
-            self.goal_pos = new_pos
-            if self.phase == 1 and self.prev_pos and self.prev_action is not None:
-                self._update_q(self.prev_pos, self.prev_action, +500, new_pos)
-            self.visited.add(new_pos)
-            self.episode_visited.add(new_pos)
-            self.episode_cells.append(new_pos)
-            self.current_pos = new_pos
-            self._finish_episode(success=True)
-            self.action_queue = []
-            if self.phase == 1:
-                self.phase        = 2
-                self.optimal_path = self._astar(self.start_pos, self.goal_pos)
-                steps = len(self.optimal_path)
-                print(f"\n  ★ Goal found at {new_pos}! Switching to A* SPEED RUN.")
-                print(f"  ★ Optimal path : {steps} steps ({steps//5+1} turns)")
-            return
-
-        # ── NORMAL MOVE ───────────────────────────────────────────────────────
-        is_new = new_pos not in self.visited
-        if self.phase == 1 and self.prev_pos and self.prev_action is not None:
-            self._update_q(self.prev_pos, self.prev_action, +10 if is_new else -1, new_pos)
-        self.visited.add(new_pos)
-        self.episode_visited.add(new_pos)
-        self.episode_cells.append(new_pos)
-        self.current_pos = new_pos
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PLAN TURN
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def plan_turn(self, last_result=None) -> List[int]:
-        if last_result is not None:
-            self._process_result(last_result)
-
-        self.episode_turns    += 1
-        self.total_turns_ever += 1
-
-        # ── PHASE 2: A* — 5 actions per turn ─────────────────────────────────
-        if self.phase == 2:
-            if self.action_queue:
-                batch, self.action_queue = self.action_queue[:5], self.action_queue[5:]
-                return self._submit(batch)
-            if self.goal_pos and self.current_pos:
-                path = self._astar(self.current_pos, self.goal_pos)
-                if path:
-                    self.action_queue = path[5:]
-                    return self._submit(path[:5])
-            return self._submit([random.choice(ACTIONS)])
-
-        # ── PHASE 1: biased BFS — 1 action per turn ───────────────────────────
-        if not self.action_queue:
-            self.action_queue = self._bfs_explore()
-        if self.action_queue:
-            return self._submit([self.action_queue.pop(0)])
-        return self._submit([random.choice(ACTIONS)])
-
-    def _submit(self, actions: List[int]) -> List[int]:
-        if actions and self.current_pos is not None:
-            self.prev_pos    = self.current_pos
-            self.prev_action = actions[0]
-        return actions or [random.choice(ACTIONS)]
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # BOOKKEEPING
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _finish_episode(self, success: bool) -> None:
-        if success:
-            self.successful_episodes += 1
-            self.all_path_lengths.append(len(self.episode_cells))
-            self.all_turns.append(self.episode_turns)
-        self.all_deaths.append(self.episode_deaths)
-
-    def finish_episode_timeout(self) -> None:
-        self._finish_episode(success=False)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # METRICS
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def get_metrics(self) -> dict:
-        t, s = self.total_episodes, self.successful_episodes
         return {
-            "phase":            self.phase,
-            "total_episodes":   t,
-            "successful":       s,
-            "success_rate":     round(s / t * 100, 1) if t else 0.0,
-            "avg_path_length":  round(float(np.mean(self.all_path_lengths)), 1) if self.all_path_lengths else 0.0,
-            "avg_turns":        round(float(np.mean(self.all_turns)), 1) if self.all_turns else 0.0,
-            "death_rate":       round(self.total_deaths_ever / max(self.total_turns_ever, 1), 4),
-            "map_completeness": round(len(self.visited) / (GRID * GRID), 4),
-            "goal_found":       self.goal_pos is not None,
-            "goal_pos":         self.goal_pos,
-            "optimal_path_len": len(self.optimal_path),
-            "unique_cells":     len(self.visited),
-            "walls_mapped":     len(self.walls),
-            "deaths_mapped":    len(self.dead_cells),
-            "teleports_mapped": len(self.teleports) // 2,
-            "confuse_mapped":   len(self.confuse),
+            "phase": "frontier-bfs",
+            "goal_found": known_cells.get(self.goal) == "goal",
+            "goal_pos": self.goal if known_cells.get(self.goal) == "goal" else None,
+            "unique_cells": len(known_cells),
+            "walls_mapped": wall_count,
+            "teleports_mapped": teleport_cells,
+            "confuse_mapped": confusion_cells,
+            "deaths_mapped": lethal_cells,
+            "wall_hits": self.wall_hits,
+            "deaths": self.deaths,
+            "teleports": self.teleports,
+            "confusion_entries": self.confusion_entries,
         }
 
-    def print_metrics(self) -> None:
-        m = self.get_metrics()
-        print("\n" + "=" * 55)
-        print("AGENT PERFORMANCE METRICS")
-        print("=" * 55)
-        print(f"  Phase              : {'SPEED RUN (A*)' if m['phase']==2 else 'EXPLORING (Biased BFS)'}")
-        print(f"  Optimal path       : {m['optimal_path_len']} steps")
-        print(f"  Episodes run       : {m['total_episodes']}")
-        print(f"  Successful         : {m['successful']}")
-        print(f"  Success rate       : {m['success_rate']}%")
-        print(f"  Avg path length    : {m['avg_path_length']} cells")
-        print(f"  Avg turns to solve : {m['avg_turns']} turns")
-        print(f"  Death rate         : {m['death_rate']}")
-        print("─" * 55)
-        print(f"  Map completeness   : {m['map_completeness']*100:.1f}%")
-        print(f"  Goal               : {m['goal_pos']}")
-        print(f"  Walls mapped       : {m['walls_mapped']}")
-        print(f"  Teleports mapped   : {m['teleports_mapped']} pairs")
-        print(f"  Confusion cells    : {m['confuse_mapped']}")
-        print("=" * 55)
+    def print_metrics(self):
+        metrics = self.get_metrics()
+        print("\nCompatibility agent metrics")
+        print(f"  phase              : {metrics['phase']}")
+        print(f"  goal_found         : {metrics['goal_found']}")
+        print(f"  unique_cells       : {metrics['unique_cells']}")
+        print(f"  walls_mapped       : {metrics['walls_mapped']}")
+        print(f"  teleports_mapped   : {metrics['teleports_mapped']}")
+        print(f"  confusion_cells    : {metrics['confuse_mapped']}")
+        print(f"  lethal_cells       : {metrics['deaths_mapped']}")
+        print(f"  wall_hits          : {metrics['wall_hits']}")
+        print(f"  deaths             : {metrics['deaths']}")
+
+
+Agent = PartialObservationAgent
+
+__all__ = ["Agent", "HybridAgent", "PartialObservationAgent", "fresh_knowledge_state"]

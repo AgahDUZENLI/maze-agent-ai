@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.zip
+4368 Maze Solver Group Project Specifications v4.pdf
+
+results/*
+!results/.gitkeep
