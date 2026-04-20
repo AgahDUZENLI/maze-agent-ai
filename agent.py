@@ -283,7 +283,7 @@ class HybridAgent:
 
                 # Only count movement to a new cell as exploration progress;
                 # don't "discover" a frontier by waiting in place.
-                if action != ACTION_WAIT and (nr, nc) not in self.episode_visited:
+                if action != ACTION_WAIT and (nr, nc) not in self.visited:
                     return new_path
 
                 heappush(heap, (nr, nd, (nr, nc), nt, new_path))
