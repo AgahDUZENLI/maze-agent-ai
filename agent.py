@@ -8,7 +8,10 @@ ACTION_UP    = 0
 ACTION_DOWN  = 1
 ACTION_LEFT  = 2
 ACTION_RIGHT = 3
-ACTIONS      = [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT]
+ACTION_WAIT  = 4
+
+MOVE_ACTIONS    = [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT]
+PLANNER_ACTIONS = [ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, ACTION_WAIT]
 
 INVERT = {0: 1, 1: 0, 2: 3, 3: 2}
 
@@ -30,7 +33,14 @@ class HybridAgent:
         self.walls:     Set[Tuple] = set()   # (row, col, action)
         self.teleports: Dict[Tuple, Tuple] = {}
         self.confuse:   Set[Tuple] = set()
-        self.dead_cells: Set[Tuple] = set()  # clears each episode (fire moves)
+
+        # Fire is not static. Learn dangerous cells by fire phase.
+        self.dead_cells_by_phase: Dict[int, Set[Tuple[int, int]]] = {
+            0: set(),
+            1: set(),
+            2: set(),
+            3: set(),
+        }
 
         # ── Visited tracking ──────────────────────────────────────────────────
         self.visited:         Set[Tuple] = set()  # global — for A* and metrics
@@ -50,6 +60,8 @@ class HybridAgent:
         self.prev_action: Optional[int]   = None
         self.action_queue: List[int]      = []
         self.is_confused  = False
+        self.atomic_action_count = 0
+        self.last_turn_start_tmod20 = 0
 
         # ── Metrics ───────────────────────────────────────────────────────────
         self.total_episodes      = 0
@@ -81,7 +93,8 @@ class HybridAgent:
         self.prev_action      = None
         self.action_queue     = []
         self.is_confused      = False
-        self.dead_cells       = set()          # fire rotates each episode
+        self.atomic_action_count = 0
+        self.last_turn_start_tmod20 = 0
         self.episode_visited  = {start_pos}   # BFS frontier resets each episode
         self.visited.add(start_pos)
         self.episode_turns    = 0
@@ -99,11 +112,7 @@ class HybridAgent:
         Return the longest safe prefix (up to 5 actions) that we are willing
         to batch in one turn.
 
-        We only batch through plain known cells:
-        - no known fire
-        - no known confusion cells
-        - no teleport pads
-        - no blocked edges
+        This is time-aware: fire danger depends on the current time_mod_20.
         """
         if not path or self.current_pos is None:
             return []
@@ -113,24 +122,33 @@ class HybridAgent:
             return []
 
         r, c = self.current_pos
+        tmod20 = self._current_tmod20()
         prefix = []
 
-        for a in path[:max_len]:
-            if not self._can_move(r, c, a, ignore_fire=False):
+        for action in path[:max_len]:
+            # Keep batching through WAIT allowed; it may be useful for timed corridors
+            if action == ACTION_WAIT:
+                prefix.append(action)
+                tmod20 = (tmod20 + 1) % 20
+                continue
+
+            # avoid batching through known special cells
+            dr, dc = DELTAS[action]
+            pad = (r + dr, c + dc)
+
+            nxt = self._transition(r, c, tmod20, action, ignore_fire=False)
+            if nxt is None:
                 break
 
-            dr, dc = DELTAS[a]
-            nr, nc = r + dr, c + dc
+            nr, nc, nt = nxt
 
-            if (nr, nc) in self.dead_cells:
+            if pad in self.teleports:
                 break
             if (nr, nc) in self.confuse:
                 break
-            if (nr, nc) in self.teleports:
-                break
 
-            prefix.append(a)
-            r, c = nr, nc
+            prefix.append(action)
+            r, c, tmod20 = nr, nc, nt
 
         return prefix
 
@@ -139,6 +157,64 @@ class HybridAgent:
         self.episode_visited.add(pos)
         self.episode_cells.append(pos)
         self.current_pos = pos
+
+    def _current_tmod20(self) -> int:
+        return self.atomic_action_count % 20
+
+    def _phase_at(self, tmod20: int) -> int:
+        return (tmod20 // 5) % 4
+
+    def _advance_internal_clock(self, actions_executed: int) -> None:
+        self.atomic_action_count += actions_executed
+
+    def _mark_fire_death(self, cell: Tuple[int, int], tmod20: int) -> None:
+        phase = self._phase_at(tmod20)
+        self.dead_cells_by_phase[phase].add(cell)
+
+    def _is_known_dead(self, cell: Tuple[int, int], tmod20: int) -> bool:
+        phase = self._phase_at(tmod20)
+        return cell in self.dead_cells_by_phase[phase]
+
+    def _transition(self, r: int, c: int, tmod20: int, action: int, ignore_fire: bool = False):
+        """
+        Simulate one planner action in the agent's internal model.
+
+        tmod20 means: number of atomic actions elapsed mod 20 BEFORE this action.
+        Fire danger for a move is checked at the current phase, then time advances by 1.
+        """
+        next_t = (tmod20 + 1) % 20
+
+        if action == ACTION_WAIT:
+            return (r, c, next_t)
+
+        if (r, c, action) in self.walls:
+            return None
+
+        dr, dc = DELTAS[action]
+        nr, nc = r + dr, c + dc
+
+        if not self._in_bounds(nr, nc):
+            return None
+
+        # teleport happens immediately on landing
+        pad = (nr, nc)
+        if pad in self.teleports:
+            nr, nc = self.teleports[pad]
+
+        # fire is checked using the phase at the START of the action
+        if not ignore_fire and self._is_known_dead((nr, nc), tmod20):
+            return None
+
+        return (nr, nc, next_t)
+
+    def _neighbors_time(self, r: int, c: int, tmod20: int, ignore_fire: bool = False) -> List[Tuple[int, int, int, int]]:
+        out = []
+        for action in PLANNER_ACTIONS:
+            nxt = self._transition(r, c, tmod20, action, ignore_fire)
+            if nxt is not None:
+                nr, nc, nt = nxt
+                out.append((nr, nc, nt, action))
+        return out
     # ─────────────────────────────────────────────────────────────────────────
     # MAP
     # ─────────────────────────────────────────────────────────────────────────
@@ -147,19 +223,21 @@ class HybridAgent:
         return 0 <= r < GRID and 0 <= c < GRID
 
     def _can_move(self, r: int, c: int, a: int, ignore_fire=False) -> bool:
+        if a == ACTION_WAIT:
+            return True
         if (r, c, a) in self.walls:
             return False
         dr, dc = DELTAS[a]
         nr, nc = r + dr, c + dc
         if not self._in_bounds(nr, nc):
             return False
-        if not ignore_fire and (nr, nc) in self.dead_cells:
+        if not ignore_fire and self._is_known_dead((nr, nc), self._current_tmod20()):
             return False
         return True
 
     def _neighbors(self, r: int, c: int, ignore_fire=False) -> List[Tuple]:
         out = []
-        for a in ACTIONS:
+        for a in MOVE_ACTIONS:
             if self._can_move(r, c, a, ignore_fire):
                 dr, dc = DELTAS[a]
                 nr, nc = r + dr, c + dc
@@ -174,35 +252,41 @@ class HybridAgent:
 
     def _bfs_explore(self, ignore_fire=False) -> List[int]:
         """
-        BFS to nearest unvisited cell THIS episode.
+        Time-aware BFS to nearest unvisited cell THIS episode.
 
-        The priority queue is sorted by (row, distance) so cells closer
-        to row 0 (the top, where the goal lives) are preferred when two
-        frontiers are equally distant. This makes the agent naturally
-        drift upward toward the exit instead of wandering randomly.
+        State includes time_mod_20 so the agent can wait for fire to rotate
+        if that produces a shorter safe route.
         """
         if self.current_pos is None:
             return []
 
-        # heap: (priority, distance, position, path)
-        # priority = row of destination (lower row = closer to top = better)
-        heap = [(self.current_pos[0], 0, self.current_pos, [])]
-        best: Dict[Tuple, int] = {self.current_pos: 0}
+        start_t = self._current_tmod20()
+
+        # heap item: (row_priority, distance, (r, c), tmod20, path)
+        heap = [(self.current_pos[0], 0, self.current_pos, start_t, [])]
+        best: Dict[Tuple[int, int, int], int] = {
+            (self.current_pos[0], self.current_pos[1], start_t): 0
+        }
 
         while heap:
-            _, dist, (r, c), path = heappop(heap)
+            _, dist, (r, c), tmod20, path = heappop(heap)
 
-            for nr, nc, action in self._neighbors(r, c, ignore_fire):
+            for nr, nc, nt, action in self._neighbors_time(r, c, tmod20, ignore_fire):
                 nd = dist + 1
-                if best.get((nr, nc), 999999) <= nd:
+                state = (nr, nc, nt)
+
+                if best.get(state, 999999) <= nd:
                     continue
-                best[(nr, nc)] = nd
+                best[state] = nd
+
                 new_path = path + [action]
 
-                if (nr, nc) not in self.episode_visited:
-                    return new_path   # found nearest unvisited, biased upward
+                # Only count movement to a new cell as exploration progress;
+                # don't "discover" a frontier by waiting in place.
+                if action != ACTION_WAIT and (nr, nc) not in self.visited:
+                    return new_path
 
-                heappush(heap, (nr, nd, (nr, nc), new_path))
+                heappush(heap, (nr, nd, (nr, nc), nt, new_path))
 
         return []
 
@@ -214,27 +298,33 @@ class HybridAgent:
         if not start or not goal:
             return []
 
+        start_t = self._current_tmod20()
+
         def h(r, c):
             return abs(r - goal[0]) + abs(c - goal[1])
 
-        heap   = [(h(*start), 0, start, [])]
-        best_g: Dict[Tuple, int] = {}
+        heap = [(h(*start), 0, start, start_t, [])]
+        best_g: Dict[Tuple[int, int, int], int] = {}
 
         while heap:
-            _, g, (r, c), path = heappop(heap)
+            _, g, (r, c), tmod20, path = heappop(heap)
 
             if (r, c) == goal:
                 return path
 
-            if best_g.get((r, c), 999999) <= g:
+            state = (r, c, tmod20)
+            if best_g.get(state, 999999) <= g:
                 continue
-            best_g[(r, c)] = g
+            best_g[state] = g
 
-            for nr, nc, a in self._neighbors(r, c, ignore_fire):
+            for nr, nc, nt, action in self._neighbors_time(r, c, tmod20, ignore_fire):
                 ng = g + 1
-                if best_g.get((nr, nc), 999999) <= ng:
+                next_state = (nr, nc, nt)
+
+                if best_g.get(next_state, 999999) <= ng:
                     continue
-                heappush(heap, (ng + h(nr, nc), ng, (nr, nc), path + [a]))
+
+                heappush(heap, (ng + h(nr, nc), ng, (nr, nc), nt, path + [action]))
 
         return []
 
@@ -243,6 +333,9 @@ class HybridAgent:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _update_q(self, prev, action, reward, new):
+        if action not in MOVE_ACTIONS:
+            return
+
         r, c   = prev
         nr, nc = new
         old    = self.q_table[r, c, action]
@@ -255,6 +348,8 @@ class HybridAgent:
 
     def _process_result(self, result) -> None:
         new_pos = result.current_position
+        start_tmod20 = self.last_turn_start_tmod20
+        death_tmod20 = (start_tmod20 + max(result.actions_executed - 1, 0)) % 20
 
         batched_turn = len(self.last_planned_actions) > 1
 
@@ -262,11 +357,12 @@ class HybridAgent:
         # Do NOT try to localize which exact intermediate action caused the event.
         if batched_turn:
             if result.is_dead:
-                self.dead_cells.add(new_pos)
+                self._mark_fire_death(new_pos, death_tmod20)
                 self.episode_deaths += 1
                 self.total_deaths_ever += 1
                 self.current_pos = self.start_pos
                 self.action_queue = []
+                self._advance_internal_clock(result.actions_executed)
                 return
 
             if result.is_goal_reached:
@@ -278,7 +374,7 @@ class HybridAgent:
                 if self.phase == 1:
                     self.phase = 2
                     self.optimal_path = self._astar(self.start_pos, self.goal_pos)
-
+                self._advance_internal_clock(result.actions_executed)
                 return
 
             if result.is_confused:
@@ -292,7 +388,7 @@ class HybridAgent:
             # if something unexpected happened in a batched turn, drop back to cautious mode
             if result.wall_hits > 0 or result.teleported or result.is_confused:
                 self.action_queue = []
-
+            self._advance_internal_clock(result.actions_executed)
             return
         
         # ── WALL ──────────────────────────────────────────────────────────────
@@ -305,11 +401,12 @@ class HybridAgent:
             if self.phase == 1:
                 self._update_q(self.prev_pos, self.prev_action, -2, self.prev_pos)
             self.action_queue = []
+            self._advance_internal_clock(result.actions_executed)
             return  # didn't move
 
         # ── DEATH ─────────────────────────────────────────────────────────────
         if result.is_dead:
-            self.dead_cells.add(new_pos)
+            self._mark_fire_death(new_pos, death_tmod20)
             if self.phase == 1 and self.prev_pos and self.prev_action is not None:
                 self._update_q(self.prev_pos, self.prev_action, -100, new_pos)
                 self.q_table[new_pos[0], new_pos[1], :] = -200.0
@@ -319,6 +416,7 @@ class HybridAgent:
             self.action_queue       = []
             if self.phase == 2 and self.goal_pos:
                 self.action_queue = self._astar(self.start_pos, self.goal_pos)
+            self._advance_internal_clock(result.actions_executed)
             return
 
         # ── TELEPORT ──────────────────────────────────────────────────────────
@@ -358,6 +456,7 @@ class HybridAgent:
                 steps = len(self.optimal_path)
                 print(f"\n  ★ Goal found at {new_pos}! Switching to A* SPEED RUN.")
                 print(f"  ★ Optimal path : {steps} steps ({steps//5+1} turns)")
+            self._advance_internal_clock(result.actions_executed)
             return
 
         # ── NORMAL MOVE ───────────────────────────────────────────────────────
@@ -368,6 +467,7 @@ class HybridAgent:
         self.episode_visited.add(new_pos)
         self.episode_cells.append(new_pos)
         self.current_pos = new_pos
+        self._advance_internal_clock(result.actions_executed)
 
     # ─────────────────────────────────────────────────────────────────────────
     # PLAN TURN
@@ -396,7 +496,7 @@ class HybridAgent:
                 next_step = self.action_queue.pop(0)
                 return self._submit([next_step])
 
-            return self._submit([random.choice(ACTIONS)])
+            return self._submit([random.choice(MOVE_ACTIONS)])
 
         # Phase 1: cautious exploration = 1 action per turn
         if not self.action_queue:
@@ -405,23 +505,26 @@ class HybridAgent:
         if self.action_queue:
             return self._submit([self.action_queue.pop(0)])
 
-        return self._submit([random.choice(ACTIONS)])
+        return self._submit([random.choice(MOVE_ACTIONS)])
 
     def _submit(self, desired_actions: List[int]) -> List[int]:
-        desired_actions = desired_actions or [random.choice(ACTIONS)]
+        desired_actions = desired_actions or [random.choice(MOVE_ACTIONS)]
 
         if self.current_pos is not None:
             self.prev_pos = self.current_pos
-            self.prev_action = desired_actions[0]   # world-direction action
+            self.prev_action = desired_actions[0] if desired_actions[0] in MOVE_ACTIONS else None
 
         self.last_planned_actions = list(desired_actions)
+        self.last_turn_start_tmod20 = self._current_tmod20()
 
-        # If confused, submit the inverse so the environment's inversion
-        # produces the world move we actually want.
-        submitted = [
-            INVERT[a] if self.is_confused else a
-            for a in desired_actions
-        ]
+        submitted = []
+        for action in desired_actions:
+            if action == ACTION_WAIT:
+                submitted.append(ACTION_WAIT)
+            elif self.is_confused:
+                submitted.append(INVERT[action])
+            else:
+                submitted.append(action)
 
         self.last_submitted_actions = list(submitted)
         return submitted
@@ -460,7 +563,7 @@ class HybridAgent:
             "optimal_path_len": len(self.optimal_path),
             "unique_cells":     len(self.visited),
             "walls_mapped":     len(self.walls),
-            "deaths_mapped":    len(self.dead_cells),
+            "deaths_mapped":    sum(len(cells) for cells in self.dead_cells_by_phase.values()),
             "teleports_mapped": len(self.teleports) // 2,
             "confuse_mapped":   len(self.confuse),
         }
