@@ -13,7 +13,7 @@
       "cells_explored": 2061,
       "total_cells_visited": 4525,
       "exploration_efficiency": 0.4554696132596685,
-      "runtime_seconds": 7.468138933181763,
+      "runtime_seconds": 7.491024971008301,
       "moves": [
         [
           62,
@@ -172973,6 +172973,7 @@
     "hazard_model": "static",
     "teleport_model": "asset-paired-fallback",
     "walls_path": "/Users/pete/Documents/Spring 2026 UH/AI/Ai Project/maze-agent-ai/TestMazes/maze-alpha/MAZE_0.png",
-    "hazards_path": "/Users/pete/Documents/Spring 2026 UH/AI/Ai Project/maze-agent-ai/TestMazes/maze-alpha/MAZE_1.png"
+    "hazards_path": "/Users/pete/Documents/Spring 2026 UH/AI/Ai Project/maze-agent-ai/TestMazes/maze-alpha/MAZE_1.png",
+    "entry_point": "solver_train.py"
   }
 }

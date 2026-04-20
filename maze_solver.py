@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from environment import Action, MazeEnvironment
+from solver_environment import Action, MazeEnvironment
 from maze_reader import DEFAULT_HAZARDS_PATH, DEFAULT_WALLS_PATH, GRID, load_maze
 
 CELL_PX = 20
