@@ -1,5 +1,7 @@
-from typing import List, Tuple, Optional
+import json
 import os
+from pathlib import Path
+from typing import List, Tuple, Optional
 
 from maze_reader import (
     load_maze,
@@ -82,6 +84,9 @@ class MazeEnvironment:
         MAZE_DIR  = os.path.join(BASE_DIR, "TestMazes", f"maze-{maze_name}")
         MAZE_PATH = os.path.join(MAZE_DIR, "MAZE_0.png")
         HAZ_PATH  = os.path.join(MAZE_DIR, "MAZE_1.png")
+        self.maze_name = maze_name
+        self.maze_path = MAZE_PATH
+        self.hazard_path = HAZ_PATH
 
         print(f"Loading maze walls  : {MAZE_PATH}")
         self.image, self.h_walls, self.v_walls = load_maze(MAZE_PATH)
@@ -119,6 +124,7 @@ class MazeEnvironment:
         self.cells_visited = []
         self.goal_reached = False
         self.episode_number = 0
+        self.replay_events = []
 
     # ────────────────────────────────────────────────────────────────────────
     def _build_teleport_map(self, hazards):
@@ -147,6 +153,7 @@ class MazeEnvironment:
         self.cells_visited = [self.start]
         self.goal_reached = False
         self.atomic_action_count = 0
+        self.replay_events = []
 
         self.episode_number += 1
         return self.start
@@ -158,6 +165,46 @@ class MazeEnvironment:
             self.hazards, self.fire_pivots = update_fire_in_hazards(
                 self.hazards, self.fire_pivots
             )
+            return True
+        return False
+
+    # ────────────────────────────────────────────────────────────────────────
+    def _record_event(
+        self,
+        turn_index,
+        action_index,
+        submitted_action,
+        effective_action,
+        position,
+        wall_hit=False,
+        teleported=False,
+        confused=False,
+        died=False,
+        goal_reached=False,
+        fire_rotated=False,
+        respawn_to_start=False,
+        forced=False,
+        forced_direction=None,
+    ):
+        self.replay_events.append(
+            {
+                "turn_index": turn_index,
+                "action_index": action_index,
+                "atomic_action_count": self.atomic_action_count,
+                "submitted_action": submitted_action,
+                "effective_action": effective_action,
+                "position": position,
+                "wall_hit": wall_hit,
+                "teleported": teleported,
+                "confused": confused,
+                "died": died,
+                "goal_reached": goal_reached,
+                "fire_rotated": fire_rotated,
+                "respawn_to_start": respawn_to_start,
+                "forced": forced,
+                "forced_direction": forced_direction,
+            }
+        )
 
     # ────────────────────────────────────────────────────────────────────────
     def _apply_push_hazard(self, result, cell_hazard):
@@ -180,26 +227,49 @@ class MazeEnvironment:
 
     # ────────────────────────────────────────────────────────────────────────
     def step(self, actions: List[int]):
+        if not actions:
+            raise ValueError("Must submit at least 1 action per turn.")
+        if len(actions) > 5:
+            raise ValueError("Cannot submit more than 5 actions per turn.")
 
         result = TurnResult()
         self.turn_count += 1
 
-        for i, action in enumerate(actions):
+        for i, submitted_action in enumerate(actions):
+            if submitted_action not in VALID_ACTIONS:
+                raise ValueError(f"Invalid action: {submitted_action}")
 
             result.actions_executed = i + 1
 
-            if action == ACTION_WAIT:
-                self._tick_fire_clock()
+            if submitted_action == ACTION_WAIT:
+                fire_rotated = self._tick_fire_clock()
+                self._record_event(
+                    turn_index=self.turn_count,
+                    action_index=i + 1,
+                    submitted_action=submitted_action,
+                    effective_action=ACTION_WAIT,
+                    position=self.agent_pos,
+                    fire_rotated=fire_rotated,
+                )
                 continue
 
-            action = INVERT_ACTION[action] if self.is_confused else action
+            effective_action = INVERT_ACTION[submitted_action] if self.is_confused else submitted_action
 
-            if not can_move(*self.agent_pos, DIRECTION_NAMES[action], self.h_walls, self.v_walls):
+            if not can_move(*self.agent_pos, DIRECTION_NAMES[effective_action], self.h_walls, self.v_walls):
                 result.wall_hits += 1
-                self._tick_fire_clock()
+                fire_rotated = self._tick_fire_clock()
+                self._record_event(
+                    turn_index=self.turn_count,
+                    action_index=i + 1,
+                    submitted_action=submitted_action,
+                    effective_action=effective_action,
+                    position=self.agent_pos,
+                    wall_hit=True,
+                    fire_rotated=fire_rotated,
+                )
                 continue
 
-            dr, dc = DELTAS[action]
+            dr, dc = DELTAS[effective_action]
             self.agent_pos = (self.agent_pos[0] + dr, self.agent_pos[1] + dc)
             self.cells_visited.append(self.agent_pos)
 
@@ -226,7 +296,21 @@ class MazeEnvironment:
                 result.is_dead = True
                 result.current_position = self.agent_pos
                 self.death_count += 1
-                self._tick_fire_clock()
+                fire_rotated = self._tick_fire_clock()
+                self._record_event(
+                    turn_index=self.turn_count,
+                    action_index=i + 1,
+                    submitted_action=submitted_action,
+                    effective_action=effective_action,
+                    position=result.current_position,
+                    teleported=result.teleported,
+                    confused=result.is_confused,
+                    died=True,
+                    fire_rotated=fire_rotated,
+                    respawn_to_start=True,
+                    forced=result.was_forced,
+                    forced_direction=result.forced_direction,
+                )
                 self.agent_pos = self.start
                 return result
 
@@ -235,10 +319,35 @@ class MazeEnvironment:
                 result.is_goal_reached = True
                 result.current_position = self.agent_pos
                 self.goal_reached = True
-                self._tick_fire_clock()
+                fire_rotated = self._tick_fire_clock()
+                self._record_event(
+                    turn_index=self.turn_count,
+                    action_index=i + 1,
+                    submitted_action=submitted_action,
+                    effective_action=effective_action,
+                    position=result.current_position,
+                    teleported=result.teleported,
+                    confused=result.is_confused,
+                    goal_reached=True,
+                    fire_rotated=fire_rotated,
+                    forced=result.was_forced,
+                    forced_direction=result.forced_direction,
+                )
                 return result
 
-            self._tick_fire_clock()
+            fire_rotated = self._tick_fire_clock()
+            self._record_event(
+                turn_index=self.turn_count,
+                action_index=i + 1,
+                submitted_action=submitted_action,
+                effective_action=effective_action,
+                position=self.agent_pos,
+                teleported=result.teleported,
+                confused=result.is_confused,
+                fire_rotated=fire_rotated,
+                forced=result.was_forced,
+                forced_direction=result.forced_direction,
+            )
 
         result.current_position = self.agent_pos
         return result
@@ -264,3 +373,49 @@ class MazeEnvironment:
             "path_length": len(self.cells_visited),
             "goal_reached": self.goal_reached,
         }
+
+    def build_replay_payload(self, agent_overlay=None, dynamic_fire=True):
+        positions = [list(self.start)] + [
+            list(event["position"]) for event in self.replay_events
+        ]
+        deaths = [
+            list(event["position"])
+            for event in self.replay_events
+            if event["died"]
+        ]
+
+        return {
+            "version": 2,
+            "episode": self.episode_number,
+            "maze_name": self.maze_name,
+            "maze_path": self.maze_path,
+            "hazard_path": self.hazard_path,
+            "start": list(self.start),
+            "goal": list(self.goal),
+            "positions": positions,
+            "deaths": deaths,
+            "dynamic_fire": dynamic_fire,
+            "events": [
+                {
+                    **event,
+                    "position": list(event["position"]),
+                }
+                for event in self.replay_events
+            ],
+            "summary": {
+                **self.get_episode_stats(),
+                "action_count": len(self.replay_events),
+            },
+            "agent_overlay": agent_overlay or {},
+        }
+
+    def export_replay(self, output_path, agent_overlay=None, dynamic_fire=True):
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.build_replay_payload(
+            agent_overlay=agent_overlay,
+            dynamic_fire=dynamic_fire,
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return path

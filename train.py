@@ -1,4 +1,5 @@
 import os
+import shutil
 import numpy as np
 import time
 
@@ -24,6 +25,7 @@ MAZE_PATH = os.path.join(MAZE_DIR, "MAZE_0.png")
 RUN_DIR   = os.path.join("runs", MAZE_NAME)
 VIZ_DIR   = os.path.join(RUN_DIR, "viz")
 SAVE_PATH = os.path.join(RUN_DIR, "q_table.npy")
+REPLAY_DIR = os.path.join(MAZE_DIR, "results", "replays")
 
 
 # ───────────────────────────────────────────────────
@@ -97,6 +99,15 @@ def run_episodes(env, agent, viz, num_episodes, mode, start_time):
             death_cells=death_cells,
             output_dir=os.path.join(VIZ_DIR, mode),
         )
+
+        replay_path = env.export_replay(
+            os.path.join(REPLAY_DIR, f"{mode}_episode_{ep:03d}.json"),
+            agent_overlay={"metrics": agent.get_metrics()},
+            dynamic_fire=True,
+        )
+        shutil.copyfile(replay_path, os.path.join(REPLAY_DIR, f"latest_{mode}.json"))
+        shutil.copyfile(replay_path, os.path.join(REPLAY_DIR, "latest.json"))
+        print(f"  replay: {replay_path}")
 
         results.append({
             "episode": ep,
