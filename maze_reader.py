@@ -13,7 +13,7 @@ get_start(h_walls)                        → (row, col)
 get_goal(h_walls)                         → (row, col)
 
 load_hazards(path)                        → {(row, col): Hazard}
-print_summary(start, goal, hazards)       → prints maze summary
+print_summary(h_walls, hazards)           → prints maze summary
 
 cell_center(row, col)                     → (x, y) pixel coords of cell centre
 
@@ -26,7 +26,7 @@ if_alive(row, col, hazards)               → bool
 get_hazard(row, col, hazards)             → Hazard | None
 
 # Dynamic fire
-update_fire_in_hazards(hazards)           → updated hazards dict
+update_fire_in_hazards(hazards, fire_groups_full) → (updated hazards, fire_groups_full)
 """
 
 from collections import Counter
@@ -41,12 +41,16 @@ from PIL import Image
 GRID  = 64   # cells per side
 WALL  = 2    # wall-strip width in pixels
 STEP  = 16   # pixels per cell (wall shared between neighbours)
-INNER = 14   # usable inner-cell size in pixels
+INNER = STEP - WALL  # inner cell width in pixels
+ARM_LENGTH = 3  # fire arm length in cells
+
+
 
 # ---------------------------------------------------------------------------
 # Actions & directions
 # ---------------------------------------------------------------------------
 ACTION_DELTAS   = {0: (-1, 0), 1: (0, 1), 2: (1, 0), 3: (0, -1)}
+ACTIONS         = list(ACTION_DELTAS.keys())
 REVERSE_ACTION  = {0: 2, 1: 3, 2: 0, 3: 1}
 ACTION_NAMES    = {0: "UP", 1: "RIGHT", 2: "DOWN", 3: "LEFT"}
 
@@ -67,16 +71,7 @@ HAZARD_LABELS = {
     Hazard.TP_GREEN:  "TP_GREEN",
     Hazard.TP_YELLOW: "TP_YELLOW",
     Hazard.TP_PURPLE: "TP_PURPLE",
-    Hazard.TP_RED:     "TP_RED",
-}
-
-HAZARD_LABELS = {
-    Hazard.FIRE:      "FIRE",
-    Hazard.CONFUSION: "CONFUSION",
-    Hazard.TP_GREEN:  "TP_GREEN",
-    Hazard.TP_YELLOW: "TP_YELLOW",
-    Hazard.TP_PURPLE: "TP_PURPLE",
-    Hazard.TP_RED:     "TP_RED",
+    Hazard.TP_RED:    "TP_RED",
 }
 
 # ---------------------------------------------------------------------------
@@ -87,7 +82,6 @@ def cell_center(row, col):
     x = WALL + col * STEP + INNER // 2
     y = WALL + row * STEP + INNER // 2
     return x, y
-
 
 # ---------------------------------------------------------------------------
 # Wall loading
@@ -210,7 +204,177 @@ def get_teleport_points(hazards):
         Hazard.TP_PURPLE: sorted([cell for cell, hz in hazards.items() if hz == Hazard.TP_PURPLE]),
         Hazard.TP_RED : sorted([cell for cell, hz in hazards.items() if hz == Hazard.TP_RED]),
     }
+# ---------------------------------------------------------------------------
+# Dynamic fire helpers
+# ---------------------------------------------------------------------------
 
+def find_fire_groups(fire_cells):
+    fire_cells = set(fire_cells)
+    groups = []
+
+    while fire_cells:
+        start = fire_cells.pop()
+        group = {start}
+        stack = [start]
+
+        while stack:
+            row, col = stack.pop()
+
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+
+                    nbr = (row + dr, col + dc)
+                    if nbr in fire_cells:
+                        fire_cells.remove(nbr)
+                        group.add(nbr)
+                        stack.append(nbr)
+
+        groups.append(group)
+
+    return groups
+
+def find_fire_corner(group):
+    """
+    Finds pivot even if it's outside the map.
+    """
+    if not group:
+        return None
+
+    fire_set = set(group)
+
+    directions = {}
+
+    # collect direction vectors
+    for r, c in group:
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if (dr, dc) == (0, 0):
+                    continue
+
+                nbr = (r + dr, c + dc)
+                if nbr in fire_set:
+                    directions.setdefault((r, c), []).append((dr, dc))
+
+    # NORMAL CASE → find V corner
+    for cell, dirs in directions.items():
+        if len(dirs) < 2:
+            continue
+
+        for i in range(len(dirs)):
+            for j in range(i + 1, len(dirs)):
+                d1 = dirs[i]
+                d2 = dirs[j]
+
+                dot = d1[0]*d2[0] + d1[1]*d2[1]
+
+                if dot == 0:
+                    return cell
+
+    # EDGE CASE → only one direction visible
+    # tip + arm_length steps toward the arm = pivot (one beyond the root)
+    for cell, dirs in directions.items():
+        if len(dirs) == 1:
+            r, c = cell
+            dr, dc = dirs[0]
+            arm_length = len(group) -1 
+            return (r + dr * arm_length, c + dc * arm_length)
+
+    # fallback
+    return next(iter(group))
+
+
+def complete_fire_group(group):
+    pivot = find_fire_corner(group)
+    if pivot is None:
+        return group
+
+    pr, pc = pivot
+
+    directions = set()
+    arm_length = 0
+    for r, c in group:
+        if (r, c) == pivot:
+            continue
+        dr = r - pr
+        dc = c - pc
+        arm_length = max(arm_length, max(abs(dr), abs(dc)))
+        if dr != 0: dr //= abs(dr)
+        if dc != 0: dc //= abs(dc)
+        directions.add((dr, dc))
+
+    if arm_length == 0:
+        arm_length = 1
+
+    # if only one arm visible, mirror it to create the other
+    if len(directions) == 1:
+        dr, dc = next(iter(directions))
+        if dr == 0:
+            directions = {(dr, dc), (dr, -dc)}    # horizontal: flip left↔right
+        elif dc == 0:
+            directions = {(dr, dc), (-dr, dc)}    # vertical: flip up↔down
+        else:
+            directions = {(dr, dc), (dr, -dc)}    # diagonal: mirror across row axis
+
+    full_group = {pivot}
+    for dr, dc in list(directions)[:2]:
+        for i in range(1, arm_length + 1):
+            full_group.add((pr + dr * i, pc + dc * i))
+
+    return full_group
+
+def rotate_fire_group_cw(group, pivot):
+    pr, pc = pivot
+    rotated = set()
+
+    for r, c in group:
+        dr, dc = r - pr, c - pc
+        new_r = pr + dc
+        new_c = pc - dr
+        rotated.add((new_r, new_c))
+
+    return rotated
+
+
+def _cells_in_bounds(cells):
+    return [c for c in cells if 0 <= c[0] < GRID and 0 <= c[1] < GRID]
+
+def init_fire_groups(hazards):
+    fire_cells = [c for c, h in hazards.items() if h == Hazard.FIRE]
+    groups = find_fire_groups(fire_cells)
+
+    fire_groups = []
+    for g in groups:
+        full = complete_fire_group(g)
+        pivot = find_fire_corner(full)
+        fire_groups.append((full, pivot))
+
+    return fire_groups
+
+
+def update_fire_in_hazards(hazards, fire_groups_full):
+    # remove old fire
+    new_hazards = {
+        cell: hz for cell, hz in hazards.items()
+        if hz != Hazard.FIRE
+    }
+
+    new_fire_groups = []
+
+    for group, pivot in fire_groups_full:
+        rotated = rotate_fire_group_cw(group, pivot)
+
+        new_fire_groups.append((rotated, pivot))
+
+        for cell in _cells_in_bounds(rotated):
+            new_hazards[cell] = Hazard.FIRE
+
+    return new_hazards, new_fire_groups
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def get_teleport_pairs(hazards):
     """
@@ -238,191 +402,36 @@ def print_teleport_pairs_exact(hazards):
         print(f"{color.value}: {pair}")
     print("=" * 55)
 
+def maze_turn(hazards, fire_groups=None):
 
-# ---------------------------------------------------------------------------
-# Dynamic fire helpers
-# ---------------------------------------------------------------------------
-def find_fire_groups(fire_cells):
+    # First turn → initialize groups
+    if fire_groups is None:
+        fire_groups = init_fire_groups(hazards)
+
+    # Rotate + update hazards
+    new_hazards, new_fire_groups = update_fire_in_hazards(
+        hazards,
+        fire_groups
+    )
+
+    return new_hazards, new_fire_groups
+
+def get_fire_state(fire_groups):
     """
-    Split fire cells into connected groups.
-
-    Uses 8-direction connectivity so diagonal V-shapes stay together.
-
-    Returns
-    -------
-    groups : list[set[(row, col)]]
+    Returns fire groups and their pivot locations.
+        [
+            {
+                "cells": set[(r,c)],
+                "pivot": (r,c)
+            },
+            ...
+        ]
     """
-    fire_cells = set(fire_cells)
-    groups = []
-
-    while fire_cells:
-        start = fire_cells.pop()
-        group = {start}
-        stack = [start]
-
-        while stack:
-            row, col = stack.pop()
-
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == 0 and dc == 0:
-                        continue
-
-                    nbr = (row + dr, col + dc)
-                    if nbr in fire_cells:
-                        fire_cells.remove(nbr)
-                        group.add(nbr)
-                        stack.append(nbr)
-
-        groups.append(group)
-
-    return groups
-
-
-def find_fire_corner(fire_group):
-    """
-    Find the junction (corner) of a V-shaped fire group.
-
-    Strategy: look for the articulation point — the cell whose removal
-    splits the group into two disconnected arms. That is exactly where
-    the two arms of the V meet.
-
-    If no single articulation point exists (e.g. a straight line),
-    fall back to the cell with the most 8-connected neighbors.
-    """
-    if not fire_group:
-        return None
-
-    fire_set = set(fire_group)
-
-    def is_connected(cells):
-        if not cells:
-            return True
-        start = next(iter(cells))
-        visited = {start}
-        stack = [start]
-        while stack:
-            r, c = stack.pop()
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == 0 and dc == 0:
-                        continue
-                    nbr = (r + dr, c + dc)
-                    if nbr in cells and nbr not in visited:
-                        visited.add(nbr)
-                        stack.append(nbr)
-        return visited == cells
-
-    articulation_points = [
-        cell for cell in fire_group
-        if not is_connected(fire_set - {cell})
+    return [
+        {"cells": group, "pivot": pivot}
+        for group, pivot in fire_groups
     ]
 
-    candidates = articulation_points if articulation_points else list(fire_group)
-
-    def junction_score(cell):
-        """
-        Score = maximum pairwise cosine between neighbor direction vectors.
-
-        V apex:    neighbors point in diverging directions → cos ≈  0  (high)
-        Mid-arm:   neighbors point in opposite directions  → cos ≈ -1  (low)
-
-        Picking the max selects the true junction, not a pass-through cut.
-        """
-        r, c = cell
-        neighbors = [
-            (r + dr, c + dc)
-            for dr in (-1, 0, 1) for dc in (-1, 0, 1)
-            if (dr, dc) != (0, 0) and (r + dr, c + dc) in fire_set
-        ]
-        if len(neighbors) < 2:
-            return float("-inf")
-
-        best = float("-inf")
-        for i in range(len(neighbors)):
-            for j in range(i + 1, len(neighbors)):
-                d1 = (neighbors[i][0] - r, neighbors[i][1] - c)
-                d2 = (neighbors[j][0] - r, neighbors[j][1] - c)
-                dot = d1[0] * d2[0] + d1[1] * d2[1]
-                mag = (d1[0] ** 2 + d1[1] ** 2) ** 0.5 * (d2[0] ** 2 + d2[1] ** 2) ** 0.5
-                if mag > 0:
-                    best = max(best, dot / mag)
-        return best
-
-    return max(candidates, key=junction_score)
-
-
-def rotate_fire_group_cw(fire_group, pivot, grid_size=GRID):
-    """
-    Rotate one fire group 90 degrees clockwise around the pivot cell.
-
-    The pivot maps to itself: (0, 0) relative → (0, 0) relative.
-    Every other cell orbits it: (r, c) relative → (c, -r) relative.
-    After 4 calls the group is back to its original position.
-
-    Cells that land outside the grid are clipped.
-    """
-    pr, pc = pivot
-    new_group = {pivot}  # pivot cell is fixed — always stays in place
-
-    for row, col in fire_group:
-        if (row, col) == pivot:
-            continue
-        rel_r = row - pr
-        rel_c = col - pc
-        # 90° CW: (r, c) → (c, -r)
-        nr = pr + rel_c
-        nc = pc - rel_r
-        if 0 <= nr < grid_size and 0 <= nc < grid_size:
-            new_group.add((nr, nc))
-
-    return new_group
-
-
-def update_fire_in_hazards(hazards, fire_pivots=None, grid_size=GRID):
-    """
-    Rotate each fire group 90° CW around its pivot and return the updated
-    hazards plus the new pivot set.
-
-    Parameters
-    ----------
-    hazards      : dict {(row, col): Hazard}
-    fire_pivots  : set of (row, col) — pivot positions from the previous call.
-                   Pass None (or omit) on the very first call; pivots are then
-                   auto-detected and returned so you can pass them next time.
-
-    Returns
-    -------
-    new_hazards  : dict {(row, col): Hazard}
-    new_pivots   : set of (row, col) — pivot positions after this rotation,
-                   ready to be passed back on the next call.
-    """
-    if fire_pivots is None:
-        fire_pivots = set()
-
-    static_hazards = {cell: hz for cell, hz in hazards.items() if hz != Hazard.FIRE}
-    fire_cells = {cell for cell, hz in hazards.items() if hz == Hazard.FIRE}
-
-    fire_groups = find_fire_groups(fire_cells)
-    new_fire_cells = set()
-    new_pivots = set()
-
-    for group in fire_groups:
-        # Reuse the known pivot if it is still present in this group;
-        # otherwise detect a fresh one (first call, or after a cell was clipped).
-        known = fire_pivots & group
-        pivot = next(iter(known)) if known else find_fire_corner(group)
-
-        if pivot is not None:
-            rotated_group = rotate_fire_group_cw(group, pivot, grid_size)
-            new_fire_cells.update(rotated_group)
-            new_pivots.add(pivot)  # pivot cell is always kept by rotate_fire_group_cw
-
-    new_hazards = dict(static_hazards)
-    for cell in new_fire_cells:
-        new_hazards[cell] = Hazard.FIRE
-
-    return new_hazards, new_pivots
 
 
 # ---------------------------------------------------------------------------
@@ -433,16 +442,15 @@ def in_bounds(row, col):
     return 0 <= row < GRID and 0 <= col < GRID
 
 
-def can_move(row, col, direction, h_walls, v_walls):
-    dr, dc = 0, 0
+def can_move(row, col, action, h_walls, v_walls):
 
-    if direction == "up":
+    if action == "up":
         dr, dc = -1, 0
-    elif direction == "down":
+    elif action == "down":
         dr, dc = 1, 0
-    elif direction == "left":
+    elif action == "left":
         dr, dc = 0, -1
-    elif direction == "right":
+    elif action == "right":
         dr, dc = 0, 1
     else:
         return False
@@ -494,7 +502,7 @@ def print_summary(h_walls, hazards):
     print("=" * 55)
     print(f"Start : {start}")
     print(f"Goal  : {goal}")
-
+    
     print(f"\nHazards detected: {len(hazards)}")
 
     counts = Counter(hazards.values())
@@ -515,10 +523,38 @@ def print_summary(h_walls, hazards):
 # Entry point – run as script for a quick inspection
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Loading maze walls from MAZE_0.png...")
-    image, h_walls, v_walls = load_maze("MAZE_0.png")
+    import os
+    import argparse
 
-    print("Loading hazards from MAZE_1.png...")
-    hazards = load_hazards("MAZE_1.png")
+    parser = argparse.ArgumentParser(description="Maze Reader")
+    parser.add_argument(
+        "--maze", "-m",
+        choices=["alpha", "beta", "gamma"],
+        default="alpha",
+        help="Which maze to load"
+    )
+    args = parser.parse_args()
 
+    # Base directory (safe no matter where you run from)
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    MAZE_DIR  = os.path.join(BASE_DIR, "TestMazes", f"maze-{args.maze}")
+    MAZE_PATH = os.path.join(MAZE_DIR, "MAZE_0.png")
+    HAZ_PATH  = os.path.join(MAZE_DIR, "MAZE_1.png")
+
+    print(f"\n=== LOADING MAZE: {args.maze.upper()} ===")
+    print(f"Maze file:    {MAZE_PATH}")
+    print(f"Hazard file:  {HAZ_PATH}")
+
+    # Safety checks
+    if not os.path.exists(MAZE_PATH):
+        raise FileNotFoundError(f"Missing: {MAZE_PATH}")
+    if not os.path.exists(HAZ_PATH):
+        raise FileNotFoundError(f"Missing: {HAZ_PATH}")
+
+    # Load data
+    image, h_walls, v_walls = load_maze(MAZE_PATH)
+    hazards = load_hazards(HAZ_PATH)
+
+    # Print summary
     print_summary(h_walls, hazards)

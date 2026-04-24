@@ -1,5 +1,7 @@
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
+import os
+import argparse
 
 from maze_reader import (
     GRID,
@@ -7,271 +9,125 @@ from maze_reader import (
     find_start_goal,
     load_hazards,
     Hazard,
-    HAZARD_LABELS,
     update_fire_in_hazards,
+    init_fire_groups
 )
 
-# ---------------------------------------------------------------------------
-# Render settings
-# ---------------------------------------------------------------------------
-CELL_PX = 100
+CELL = 12  # small = fast rendering
 
-HAZARD_FILL = {
-    Hazard.FIRE:      (255, 180, 120),
-    Hazard.CONFUSION: (160, 230, 255),
-    Hazard.TP_GREEN:  (120, 230, 150),
-    Hazard.TP_YELLOW: (255, 235, 100),
-    Hazard.TP_PURPLE: (210, 140, 255),
-    Hazard.TP_RED:    (255, 150, 150),
+COLORS = {
+    "bg": (255, 255, 255),
+    "wall": (0, 0, 0),
+    "start": (0, 200, 0),
+    "goal": (200, 0, 0),
+
+    Hazard.FIRE:      (255, 120, 80),
+    Hazard.CONFUSION: (120, 200, 255),
+    Hazard.TP_GREEN:  (120, 255, 150),
+    Hazard.TP_YELLOW: (255, 230, 100),
+    Hazard.TP_PURPLE: (200, 120, 255),
+    Hazard.TP_RED:    (255, 120, 120),
 }
 
-HAZARD_SHORT = {
-    Hazard.FIRE:      "FIRE",
-    Hazard.CONFUSION: "CONF",
-    Hazard.TP_GREEN:  "GRN",
-    Hazard.TP_YELLOW: "YLW",
-    Hazard.TP_PURPLE: "PRP",
-    Hazard.TP_RED:    "RED",
-}
 
-START_FILL = (180, 255, 180)
-GOAL_FILL  = (255, 160, 160)
-WALL_COL   = (30, 30, 30)
-BG_COL     = (255, 255, 255)
-
-COORD_COL  = (80, 80, 80)
-HAZ_COL    = (20, 20, 20)
-
-
-# ---------------------------------------------------------------------------
-# Font loader
-# ---------------------------------------------------------------------------
-def _font(size):
-    try:
-        return ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            size
-        )
-    except Exception:
-        return ImageFont.load_default()
-
-
-# ---------------------------------------------------------------------------
-# Fire debug printer
-# ---------------------------------------------------------------------------
-def print_fire_turns(hazards, num_turns=4):
-    current_hazards = dict(hazards)
-    pivots = None
-
-    for turn in range(num_turns + 1):
-        fire_cells = sorted(
-            [cell for cell, hz in current_hazards.items() if hz == Hazard.FIRE]
-        )
-
-        print(f"\nTURN {turn}")
-        print(f"Fire cells ({len(fire_cells)}):")
-        for cell in fire_cells:
-            print(cell)
-
-        if turn < num_turns:
-            current_hazards, pivots = update_fire_in_hazards(current_hazards, pivots)
-
-
-# ---------------------------------------------------------------------------
-# Annotated renderer
-# ---------------------------------------------------------------------------
-def render_annotated(h_walls, v_walls, start, goal, hazards, out_path, turn=None):
-    wall_px = max(2, CELL_PX // 10)
-    total = GRID * CELL_PX + wall_px
-
-    img = Image.new("RGB", (total, total), BG_COL)
+def render_map(h_walls, v_walls, start, goal, hazards, path):
+    size = GRID * CELL
+    img = Image.new("RGB", (size, size), COLORS["bg"])
     draw = ImageDraw.Draw(img)
 
-    coord_font = _font(max(8, CELL_PX // 9))
-    haz_font = _font(max(9, CELL_PX // 8))
-    title_font = _font(22)
+    # draw cells
+    for r in range(GRID):
+        for c in range(GRID):
+            x0 = c * CELL
+            y0 = r * CELL
+            x1 = x0 + CELL
+            y1 = y0 + CELL
 
-    # draw cell fills
-    for row in range(GRID):
-        for col in range(GRID):
-            x0 = col * CELL_PX + wall_px
-            y0 = row * CELL_PX + wall_px
-            x1 = x0 + CELL_PX - wall_px
-            y1 = y0 + CELL_PX - wall_px
-
-            if (row, col) == start:
-                fill = START_FILL
-            elif (row, col) == goal:
-                fill = GOAL_FILL
-            elif (row, col) in hazards:
-                fill = HAZARD_FILL.get(hazards[(row, col)], (230, 230, 230))
+            if (r, c) == start:
+                color = COLORS["start"]
+            elif (r, c) == goal:
+                color = COLORS["goal"]
+            elif (r, c) in hazards:
+                color = COLORS.get(hazards[(r, c)], (200, 200, 200))
             else:
-                fill = BG_COL
+                continue
 
-            draw.rectangle([x0, y0, x1, y1], fill=fill)
+            draw.rectangle([x0, y0, x1, y1], fill=color)
 
-    # draw horizontal walls
-    for wi in range(GRID + 1):
-        for col in range(GRID):
-            if h_walls[wi, col]:
-                x0 = col * CELL_PX
-                y0 = wi * CELL_PX
-                x1 = x0 + CELL_PX + wall_px
-                y1 = y0 + wall_px
-                draw.rectangle([x0, y0, x1, y1], fill=WALL_COL)
+    # draw walls
+    for r in range(GRID):
+        for c in range(GRID):
+            if h_walls[r, c]:
+                draw.line([(c*CELL, r*CELL), ((c+1)*CELL, r*CELL)], fill=COLORS["wall"])
+            if v_walls[r, c]:
+                draw.line([(c*CELL, r*CELL), (c*CELL, (r+1)*CELL)], fill=COLORS["wall"])
 
-    # draw vertical walls
-    for row in range(GRID):
-        for wi in range(GRID + 1):
-            if v_walls[row, wi]:
-                x0 = wi * CELL_PX
-                y0 = row * CELL_PX
-                x1 = x0 + wall_px
-                y1 = y0 + CELL_PX + wall_px
-                draw.rectangle([x0, y0, x1, y1], fill=WALL_COL)
-
-    # labels
-    for row in range(GRID):
-        for col in range(GRID):
-            cx = col * CELL_PX + CELL_PX // 2
-            cy = row * CELL_PX + CELL_PX // 2
-
-            coord_text = f"({row},{col})"
-            bbox = draw.textbbox((0, 0), coord_text, font=coord_font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-            draw.text(
-                (cx - tw // 2, cy - CELL_PX // 4 - th // 2),
-                coord_text,
-                fill=COORD_COL,
-                font=coord_font
-            )
-
-            if (row, col) == start:
-                label = "START"
-            elif (row, col) == goal:
-                label = "GOAL"
-            elif (row, col) in hazards:
-                label = HAZARD_SHORT[hazards[(row, col)]]
-            else:
-                label = None
-
-            if label:
-                bbox2 = draw.textbbox((0, 0), label, font=haz_font)
-                lw = bbox2[2] - bbox2[0]
-                draw.text(
-                    (cx - lw // 2, cy + CELL_PX // 8),
-                    label,
-                    fill=HAZ_COL,
-                    font=haz_font
-                )
-
-    if turn is not None:
-        draw.text((10, 10), f"TURN {turn}", fill=(0, 0, 0), font=title_font)
-
-    img.save(out_path)
-    print(f"Saved → {out_path}")
+    img.save(path)
 
 
-# ---------------------------------------------------------------------------
-# Render every fire turn
-# ---------------------------------------------------------------------------
-def render_fire_turns(h_walls, v_walls, start, goal, hazards, out_dir, num_turns=4):
-    current_hazards = dict(hazards)
-    pivots = None
+def render_turns(h_walls, v_walls, start, goal, hazards, out_dir, steps=8):
+    current = dict(hazards)
+    state = init_fire_groups(current)
 
-    for turn in range(num_turns + 1):
-        out_path = out_dir / f"maze_turn_{turn}.png"
-        render_annotated(
+    for t in range(steps + 1):
+        print(f"Turn {t}")
+
+        render_map(
             h_walls, v_walls, start, goal,
-            current_hazards, out_path, turn=turn
+            current,
+            out_dir / f"turn_{t}.png"
         )
 
-        fire_cells = sorted(
-            [cell for cell, hz in current_hazards.items() if hz == Hazard.FIRE]
-        )
-        print(f"\nTURN {turn}")
-        print(f"Fire count: {len(fire_cells)}")
-        print(fire_cells)
-
-        if turn < num_turns:
-            current_hazards, pivots = update_fire_in_hazards(current_hazards, pivots)
+        current, state = update_fire_in_hazards(current, state)
 
 
 # ---------------------------------------------------------------------------
-# Legend image
-# ---------------------------------------------------------------------------
-def render_legend(hazards, start, goal, out_path):
-    entries = [
-        ("START", START_FILL, "Entry cell"),
-        ("GOAL", GOAL_FILL, "Exit cell"),
-    ] + [
-        (HAZARD_SHORT[h], HAZARD_FILL.get(h, (200, 200, 200)), HAZARD_LABELS[h])
-        for h in sorted({v for v in hazards.values()}, key=lambda x: x.value)
-    ]
-
-    row_h = 40
-    sw = 30
-    width = 320
-    height = row_h * len(entries) + 20
-    img = Image.new("RGB", (width, height), (245, 245, 245))
-    draw = ImageDraw.Draw(img)
-    font = _font(15)
-
-    draw.text((8, 4), "LEGEND", fill=(0, 0, 0), font=_font(16))
-
-    for i, (short, fill, label) in enumerate(entries):
-        y = 24 + i * row_h
-        draw.rectangle([8, y, 8 + sw, y + sw], fill=fill, outline=(80, 80, 80))
-        draw.text(
-            (8 + sw + 8, y + 6),
-            f"{short}  —  {label}",
-            fill=(20, 20, 20),
-            font=font
-        )
-
-    img.save(out_path)
-    print(f"Saved → {out_path}")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
+# MAIN (FIXED)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    out_dir = Path("results")
-    out_dir.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--maze", "-m",
+        choices=["alpha", "beta", "gamma"],
+        default="alpha"
+    )
+    parser.add_argument(
+        "--steps", "-s",
+        type=int,
+        default=5,
+        help="Number of simulation steps"
+    )
+    args = parser.parse_args()
 
-    print("Loading maze...")
-    image, h_walls, v_walls = load_maze("MAZE_0.png")
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    MAZE_DIR  = os.path.join(BASE_DIR, "TestMazes", f"maze-{args.maze}")
+    MAZE_PATH = os.path.join(MAZE_DIR, "MAZE_0.png")
+    HAZ_PATH  = os.path.join(MAZE_DIR, "MAZE_1.png")
+
+    out_dir = Path(BASE_DIR) / "results" / args.maze
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nLoading maze: {MAZE_PATH}")
+    print(f"Loading hazards: {HAZ_PATH}")
+
+    if not os.path.exists(MAZE_PATH):
+        raise FileNotFoundError(MAZE_PATH)
+    if not os.path.exists(HAZ_PATH):
+        raise FileNotFoundError(HAZ_PATH)
+
+    _, h_walls, v_walls = load_maze(MAZE_PATH)
     start, goal = find_start_goal(h_walls)
-    print(f"start={start}  goal={goal}")
+    hazards = load_hazards(HAZ_PATH)
 
-    print("Loading hazards...")
-    hazards = load_hazards("MAZE_1.png")
-    print(f"{len(hazards)} hazard cells found")
-
-    print("\nPrinting fire turns...")
-    print_fire_turns(hazards, num_turns=8)
-
-    print("\nRendering original annotated maze...")
-    render_annotated(
-        h_walls, v_walls, start, goal, hazards,
-        out_path=out_dir / "annotated_maze.png"
+    render_turns(
+        h_walls,
+        v_walls,
+        start,
+        goal,
+        hazards,
+        out_dir,
+        steps=args.steps
     )
 
-    render_legend(
-        hazards, start, goal,
-        out_path=out_dir / "annotated_maze_legend.png"
-    )
-
-    print("\nRendering fire turns...")
-    render_fire_turns(
-        h_walls, v_walls, start, goal, hazards,
-        out_dir=out_dir,
-        num_turns=8
-    )
-
-    print("\nDone. Files in results/:")
-    print("  annotated_maze.png")
-    print("  annotated_maze_legend.png")
-    print("  maze_turn_0.png ... maze_turn_8.png")
+    print("\nDone.")
