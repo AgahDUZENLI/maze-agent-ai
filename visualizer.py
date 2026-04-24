@@ -14,8 +14,9 @@ class MazeVisualizer:
         self.gif_skip = gif_skip
         self.frame_duration = int(1000 / gif_fps)
 
-        # persistent exploration memory
-        self.discovered_hazards = set()
+        # 🔥 persistent memory
+        self.discovered_cells = set()      # explored path
+        self.discovered_hazards = set()   # ALL hazards ever seen
 
     # ───────────────────────────────────────────────
     def _build_base_image(self, maze_path):
@@ -45,26 +46,22 @@ class MazeVisualizer:
         overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
         draw_overlay = ImageDraw.Draw(overlay)
 
-        draw = ImageDraw.Draw(frame)
-
-        # 🗺️ explored cells (transparent tint)
-        for r, c in self.discovered_hazards:
+        # 🗺️ explored cells (subtle)
+        for r, c in self.discovered_cells:
             x0 = c * CELL_SIZE
             y0 = r * CELL_SIZE
             x1 = x0 + CELL_SIZE
             y1 = y0 + CELL_SIZE
 
-            # light transparent gray
             draw_overlay.rectangle(
                 [x0, y0, x1, y1],
-                fill=(200, 200, 200, 60)   # alpha = 60 (subtle)
+                fill=(200, 200, 200, 50)
             )
 
-        # blend overlay
         frame = Image.alpha_composite(frame, overlay)
         draw = ImageDraw.Draw(frame)
 
-        # 🔥 fire (fade if unknown)
+        # 🔥 FIRE (persist once seen)
         for group, pivot in fire_groups:
             pr, pc = pivot
 
@@ -74,8 +71,8 @@ class MazeVisualizer:
                 x1 = x0 + CELL_SIZE
                 y1 = y0 + CELL_SIZE
 
-                discovered = (r, c) in self.discovered_hazards
-                color = (255, 80, 0) if discovered else (255, 180, 150)
+                seen = (r, c) in self.discovered_hazards
+                color = (255, 80, 0) if seen else (255, 180, 150)
 
                 draw.rectangle([x0, y0, x1, y1], fill=color)
 
@@ -88,7 +85,7 @@ class MazeVisualizer:
             else:
                 draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=(180, 180, 180))
 
-        # other hazards
+        # 🧠 OTHER HAZARDS
         for (r, c), hz in hazards.items():
             if hz == Hazard.FIRE:
                 continue
@@ -98,20 +95,20 @@ class MazeVisualizer:
             x1 = x0 + CELL_SIZE
             y1 = y0 + CELL_SIZE
 
-            discovered = (r, c) in self.discovered_hazards
+            seen = (r, c) in self.discovered_hazards
 
             if hz == Hazard.CONFUSION:
-                color = (160, 120, 60) if discovered else (210, 190, 150)
+                color = (160, 120, 60) if seen else (210, 190, 150)
 
             elif "tp" in hz.value:
-                color = (100, 200, 255) if discovered else (180, 220, 240)
+                color = (100, 200, 255) if seen else (180, 220, 240)
 
             else:
                 continue
 
             draw.rectangle([x0, y0, x1, y1], fill=color)
 
-        # 🟦 path
+        # 🟦 PATH
         if len(path) > 1:
             pts = [
                 (c * CELL_SIZE + CELL_SIZE // 2,
@@ -120,7 +117,7 @@ class MazeVisualizer:
             ]
             draw.line(pts, fill=(0, 0, 255), width=2)
 
-        # 🟥 deaths
+        # 🟥 DEATHS
         for r, c in deaths:
             x0 = c * CELL_SIZE
             y0 = r * CELL_SIZE
@@ -128,7 +125,7 @@ class MazeVisualizer:
             y1 = y0 + CELL_SIZE
             draw.rectangle([x0, y0, x1, y1], fill=(255, 0, 0))
 
-        # 🟩 agent
+        # 🟩 AGENT
         r, c = env.agent_pos
         x0 = c * CELL_SIZE
         y0 = r * CELL_SIZE
@@ -144,10 +141,15 @@ class MazeVisualizer:
         if env.turn % self.gif_skip != 0:
             return
 
-        # update exploration
-        self.discovered_hazards.add(env.agent_pos)
-        self.discovered_hazards.update(path_so_far)
-        self.discovered_hazards.update(deaths_so_far)
+        # ✅ track explored cells
+        self.discovered_cells.add(env.agent_pos)
+        self.discovered_cells.update(path_so_far)
+        self.discovered_cells.update(deaths_so_far)
+
+        # 🔥 FIX: track ALL hazards seen this turn
+        for cell, hz in env.hazards.items():
+            if hz is not None:
+                self.discovered_hazards.add(cell)
 
         phases = self._generate_fire_phases(env.hazards, env.fire_pivots)
 
