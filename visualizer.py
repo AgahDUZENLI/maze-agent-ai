@@ -14,7 +14,7 @@ class MazeVisualizer:
         self.gif_skip = gif_skip
         self.frame_duration = int(1000 / gif_fps)
 
-        # 🔥 persistent memory
+        # persistent memory
         self.discovered_cells = set()      # explored path
         self.discovered_hazards = set()   # ALL hazards ever seen
 
@@ -46,7 +46,7 @@ class MazeVisualizer:
         overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
         draw_overlay = ImageDraw.Draw(overlay)
 
-        # 🗺️ explored cells (subtle)
+        # explored cells (subtle)
         for r, c in self.discovered_cells:
             x0 = c * CELL_SIZE
             y0 = r * CELL_SIZE
@@ -61,7 +61,7 @@ class MazeVisualizer:
         frame = Image.alpha_composite(frame, overlay)
         draw = ImageDraw.Draw(frame)
 
-        # 🔥 FIRE (persist once seen)
+        # FIRE (persist once seen)
         for group, pivot in fire_groups:
             pr, pc = pivot
 
@@ -85,7 +85,7 @@ class MazeVisualizer:
             else:
                 draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=(180, 180, 180))
 
-        # 🧠 OTHER HAZARDS
+        # OTHER HAZARDS
         for (r, c), hz in hazards.items():
             if hz == Hazard.FIRE:
                 continue
@@ -108,7 +108,7 @@ class MazeVisualizer:
 
             draw.rectangle([x0, y0, x1, y1], fill=color)
 
-        # 🟦 PATH
+        # PATH
         if len(path) > 1:
             pts = [
                 (c * CELL_SIZE + CELL_SIZE // 2,
@@ -117,7 +117,7 @@ class MazeVisualizer:
             ]
             draw.line(pts, fill=(0, 0, 255), width=2)
 
-        # 🟥 DEATHS
+        # DEATHS
         for r, c in deaths:
             x0 = c * CELL_SIZE
             y0 = r * CELL_SIZE
@@ -125,7 +125,7 @@ class MazeVisualizer:
             y1 = y0 + CELL_SIZE
             draw.rectangle([x0, y0, x1, y1], fill=(255, 0, 0))
 
-        # 🟩 AGENT
+        # AGENT
         r, c = env.agent_pos
         x0 = c * CELL_SIZE
         y0 = r * CELL_SIZE
@@ -141,12 +141,12 @@ class MazeVisualizer:
         if env.turn % self.gif_skip != 0:
             return
 
-        # ✅ track explored cells
+        # track explored cells
         self.discovered_cells.add(env.agent_pos)
         self.discovered_cells.update(path_so_far)
         self.discovered_cells.update(deaths_so_far)
 
-        # 🔥 FIX: track ALL hazards seen this turn
+        # FIX: track ALL hazards seen this turn
         for cell, hz in env.hazards.items():
             if hz is not None:
                 self.discovered_hazards.add(cell)
