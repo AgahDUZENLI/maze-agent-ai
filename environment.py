@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from maze_reader import (
     load_maze,
     load_hazards,
@@ -8,6 +8,8 @@ from maze_reader import (
     can_move,
     Hazard,
     GRID,
+    is_push_hazard,
+    push_direction_for_hazard,
 )
 
 # ── Action constants ────────────────────────────────────────────────────────
@@ -53,13 +55,15 @@ class TurnResult:
 
     Fields
     ------
-    wall_hits        : how many of the submitted actions hit a wall (0-5)
-    current_position : agent's (row, col) after the turn
-    is_dead          : True if agent stepped on fire this turn
-    is_confused      : True if agent stepped on a confusion trap this turn
-    is_goal_reached  : True if agent reached the goal this turn
-    teleported       : True if agent stepped on a teleporter this turn
-    actions_executed : how many actions ran before death/goal (1-5)
+    wall_hits         : how many of the submitted actions hit a wall (0-5)
+    current_position  : agent's (row, col) after the turn
+    is_dead           : True if agent stepped on fire this turn
+    is_confused       : True if agent stepped on a confusion trap this turn
+    is_goal_reached   : True if agent reached the goal this turn
+    teleported        : True if agent stepped on a teleporter this turn
+    was_forced        : True if a push hazard forced an extra move this turn
+    forced_direction  : action id of the push direction, if any
+    actions_executed  : how many submitted actions ran before death/goal (1-5)
     """
     def __init__(self):
         self.wall_hits:        int             = 0
@@ -68,6 +72,8 @@ class TurnResult:
         self.is_confused:      bool            = False
         self.is_goal_reached:  bool            = False
         self.teleported:       bool            = False
+        self.was_forced:       bool            = False
+        self.forced_direction: Optional[int]      = None
         self.actions_executed: int             = 0
 
     def __repr__(self):
@@ -78,6 +84,8 @@ class TurnResult:
             f"goal={self.is_goal_reached}, "
             f"wall_hits={self.wall_hits}, "
             f"teleported={self.teleported}, "
+            f"forced={self.was_forced}, "
+            f"forced_dir={self.forced_direction}, "
             f"confused={self.is_confused}, "
             f"actions={self.actions_executed})"
         )
@@ -129,6 +137,8 @@ class MazeEnvironment:
         print(f"Fire cells          : {counts.get(Hazard.FIRE, 0)}")
         print(f"Confusion traps     : {counts.get(Hazard.CONFUSION, 0)}")
         print(f"Teleporters (cells) : {counts.get(Hazard.TP_GREEN,0) + counts.get(Hazard.TP_YELLOW,0) + counts.get(Hazard.TP_PURPLE,0) + counts.get(Hazard.TP_RED,0)}")
+        print(f"Push-up hazards     : {counts.get(Hazard.PUSH_UP, 0)}")
+        print(f"Push-left hazards   : {counts.get(Hazard.PUSH_LEFT, 0)}")
         print()
 
         # ── Episode state (reset each episode) ──────────────────────────────
@@ -200,6 +210,33 @@ class MazeEnvironment:
                 self.fire_pivots
             )
 
+    def _apply_push_hazard(self, result: TurnResult, cell_hazard):
+        if not is_push_hazard(cell_hazard):
+            return cell_hazard
+
+        forced_delta = push_direction_for_hazard(cell_hazard)
+        forced_action = None
+        for action, delta in DELTAS.items():
+            if delta == forced_delta:
+                forced_action = action
+                break
+
+        result.was_forced = True
+        result.forced_direction = forced_action
+
+        row, col = self.agent_pos
+        direction = DIRECTION_NAMES[forced_action]
+
+        # Assumption: the push hazard forces at most one extra move within the
+        # same submitted action. If the forced direction is blocked by a wall,
+        # the agent stays on the push tile.
+        if can_move(row, col, direction, self.h_walls, self.v_walls):
+            dr, dc = DELTAS[forced_action]
+            self.agent_pos = (row + dr, col + dc)
+            self.cells_visited.append(self.agent_pos)
+
+        return self.hazards.get(self.agent_pos)
+
 
     def step(self, actions: List[int]) -> TurnResult:
         if not actions:
@@ -236,6 +273,9 @@ class MazeEnvironment:
             self.cells_visited.append(self.agent_pos)
 
             cell_hazard = self.hazards.get(self.agent_pos)
+
+            # directional push hazards (Maze-gamma)
+            cell_hazard = self._apply_push_hazard(result, cell_hazard)
 
             # teleport
             if self.agent_pos in self.teleport_map:

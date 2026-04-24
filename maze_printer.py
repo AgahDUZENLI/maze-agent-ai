@@ -23,6 +23,8 @@ HAZARD_FILL = {
     Hazard.TP_YELLOW: (255, 235, 100),
     Hazard.TP_PURPLE: (210, 140, 255),
     Hazard.TP_RED:    (255, 150, 150),
+    Hazard.PUSH_UP:   (70, 130, 180),
+    Hazard.PUSH_LEFT: (100, 149, 237),
 }
 
 HAZARD_SHORT = {
@@ -32,6 +34,8 @@ HAZARD_SHORT = {
     Hazard.TP_YELLOW: "YLW",
     Hazard.TP_PURPLE: "PRP",
     Hazard.TP_RED:    "RED",
+    Hazard.PUSH_UP:   "P↑",
+    Hazard.PUSH_LEFT: "P←",
 }
 
 START_FILL = (180, 255, 180)

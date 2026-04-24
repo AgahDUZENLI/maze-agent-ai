@@ -60,6 +60,8 @@ class Hazard(Enum):
     TP_YELLOW  = "tp_yellow"
     TP_PURPLE  = "tp_purple"
     TP_RED     = "tp_red"
+    PUSH_UP    = "push_up"
+    PUSH_LEFT  = "push_left"
 
 HAZARD_LABELS = {
     Hazard.FIRE:      "FIRE",
@@ -67,16 +69,14 @@ HAZARD_LABELS = {
     Hazard.TP_GREEN:  "TP_GREEN",
     Hazard.TP_YELLOW: "TP_YELLOW",
     Hazard.TP_PURPLE: "TP_PURPLE",
-    Hazard.TP_RED:     "TP_RED",
+    Hazard.TP_RED:    "TP_RED",
+    Hazard.PUSH_UP:   "PUSH_UP",
+    Hazard.PUSH_LEFT: "PUSH_LEFT",
 }
 
-HAZARD_LABELS = {
-    Hazard.FIRE:      "FIRE",
-    Hazard.CONFUSION: "CONFUSION",
-    Hazard.TP_GREEN:  "TP_GREEN",
-    Hazard.TP_YELLOW: "TP_YELLOW",
-    Hazard.TP_PURPLE: "TP_PURPLE",
-    Hazard.TP_RED:     "TP_RED",
+PUSH_DELTAS = {
+    Hazard.PUSH_UP:   (-1, 0),
+    Hazard.PUSH_LEFT: (0, -1),
 }
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,37 @@ def _classify_color(r, g, b):
     return None
 
 
+def _classify_arrow_shape(patch):
+    """
+    Detect Maze-gamma push hazards.
+
+    In the supplied gamma image, push hazards are blue square tiles with a
+    white arrow inside. We therefore detect a blue tile first, then infer the
+    arrow direction from the shape of the white pixels.
+    """
+    interior = patch[1:-1, 1:-1] if min(patch.shape[:2]) >= 3 else patch
+
+    blue = (
+        (interior[:, :, 0] >= 70) & (interior[:, :, 0] <= 150) &
+        (interior[:, :, 1] >= 130) & (interior[:, :, 1] <= 195) &
+        (interior[:, :, 2] >= 210)
+    )
+    if int(blue.sum()) < 30:
+        return None
+
+    white = np.all(interior >= 220, axis=2)
+    ys, xs = np.where(white)
+    if len(xs) < 12:
+        return None
+
+    # Up arrows spread more vertically; left arrows spread more horizontally.
+    if float(np.var(ys)) > float(np.var(xs)):
+        return Hazard.PUSH_UP
+    return Hazard.PUSH_LEFT
+
+
 def load_hazards(path="MAZE_1.png"):
+
     """
     Detect hazard type for every cell by sampling a 10×10 pixel patch
     around the cell centre, filtering out background pixels, then
@@ -185,6 +215,14 @@ def load_hazards(path="MAZE_1.png"):
             is_white = np.all(patch > 228, axis=2)
             is_black = np.all(patch < 40,  axis=2)
             mask     = ~is_white & ~is_black
+            arrow_hz = _classify_arrow_shape(patch)
+
+            # Check directional hazards first. Their blue background would
+            # otherwise be misread as a green teleporter by color alone.
+            if arrow_hz is not None:
+                hazards[(row, col)] = arrow_hz
+                continue
+
             if mask.sum() < 4:
                 continue
 
@@ -423,6 +461,14 @@ def update_fire_in_hazards(hazards, fire_pivots=None, grid_size=GRID):
         new_hazards[cell] = Hazard.FIRE
 
     return new_hazards, new_pivots
+
+
+def is_push_hazard(hazard):
+    return hazard in PUSH_DELTAS
+
+
+def push_direction_for_hazard(hazard):
+    return PUSH_DELTAS.get(hazard)
 
 
 # ---------------------------------------------------------------------------

@@ -100,6 +100,10 @@ class MazeVisualizer:
         for (r, c), hz in env.hazards.items():
             if hz == Hazard.FIRE:
                 fill_cell(r, c, (255, 80, 0, 160))   # orange-red
+            elif hz == Hazard.PUSH_UP:
+                fill_cell(r, c, (70, 130, 180, 150))
+            elif hz == Hazard.PUSH_LEFT:
+                fill_cell(r, c, (100, 149, 237, 150))
 
         # ── 3. Known confusion cells (purple) ─────────────────────────────────
         for (r, c) in agent.confuse:
@@ -155,6 +159,8 @@ class MazeVisualizer:
             ((255, 215, 0),   "goal"),
             ((180, 0, 255),   "confusion"),
             ((255, 165, 0),   "teleport"),
+            ((70, 130, 180),  "push-up"),
+            ((100, 149, 237), "push-left"),
         ]
 
         # Semi-transparent legend background
