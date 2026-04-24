@@ -41,6 +41,9 @@ def run_episodes(env, agent, viz, num_episodes, mode, start_time, episode_offset
     """
     Run a block of episodes. mode is either 'train' or 'test'.
     freeze_epsilon=True locks epsilon at 0 (pure exploitation of a trained policy).
+    For test episodes without a prior policy (beta/gamma), freeze_epsilon starts False
+    but is automatically flipped to True once the goal is found for the first time,
+    so all subsequent episodes exploit the discovered path.
     Returns a list of per-episode stat dicts.
     """
     assert mode in ("train", "test")
@@ -50,15 +53,29 @@ def run_episodes(env, agent, viz, num_episodes, mode, start_time, episode_offset
         saved_epsilon = agent.epsilon
         agent.epsilon = 0.0
 
+    goal_ever_found = freeze_epsilon  # if already trained, treat goal as known
+
     results = []
 
     for ep in range(1, num_episodes + 1):
         episode_num = episode_offset + ep
 
         start_pos   = env.reset()
+
+        # Preserve maze knowledge that survives across episodes.
+        # reset_episode() wipes goal_pos and phase, so the agent would
+        # re-explore blindly even when it already knows the goal location.
+        saved_goal  = agent.goal_pos if goal_ever_found else None
+        saved_walls = set(agent.walls)
+        saved_tele  = dict(agent.teleports)
+
         agent.reset_episode(start_pos)
-        if freeze_epsilon:
-            agent.epsilon = 0.0     # keep pinned after reset
+
+        if saved_goal is not None:
+            agent.goal_pos   = saved_goal
+            agent.walls      = saved_walls
+            agent.teleports  = saved_tele
+            agent.epsilon    = 0.0      # exploit the known path
 
         last_result = None
         success     = False
@@ -74,10 +91,17 @@ def run_episodes(env, agent, viz, num_episodes, mode, start_time, episode_offset
             if last_result.is_dead:
                 death_cells.append(last_result.current_position)
                 agent.current_pos = env.start
+                # Death drops the agent to phase 1 internally. If we already
+                # know the goal and have an optimal path, restore phase 2 and
+                # re-queue the full path from start so replay resumes correctly.
+                if goal_ever_found and agent.optimal_path:
+                    agent.phase = 2
+                    agent.action_queue = list(agent.optimal_path)
 
             if last_result.is_goal_reached:
                 agent._process_result(last_result)
                 success = True
+                goal_ever_found = True  # freeze epsilon from next episode onward
                 agent.all_path_lengths[-1] = env.get_episode_stats()["path_length"]
                 print(f"  [DEBUG] Goal reached! turn={turn} pos={last_result.current_position} agent.goal_pos={agent.goal_pos}")
                 break
@@ -206,4 +230,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
